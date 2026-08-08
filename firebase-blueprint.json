@@ -1,0 +1,59 @@
+{
+  "entities": {
+    "classes": {
+      "title": "Classes",
+      "description": "Classrooms managed by teachers",
+      "properties": {
+        "name": { "type": "string" },
+        "schedule": { "type": "string" },
+        "target": { "type": "string" },
+        "archived": { "type": "boolean" },
+        "gradeLevel": { "type": "number" },
+        "assistantName": { "type": "string" },
+        "assistantPhone": { "type": "string" }
+      },
+      "required": ["name"]
+    },
+    "students": {
+      "title": "Students",
+      "description": "Student roster",
+      "properties": {
+        "classId": { "type": "string" },
+        "fullName": { "type": "string" },
+        "parentPhone": { "type": "string" },
+        "parentName": { "type": "string" },
+        "status": { "type": "string" },
+        "currentGradeYear": { "type": "number" },
+        "note": { "type": "string" },
+        "leaveReason": { "type": "string" }
+      },
+      "required": ["fullName"]
+    },
+    "sessions": {
+      "title": "Sessions",
+      "description": "Class study sessions",
+      "properties": {
+        "classId": { "type": "string" },
+        "date": { "type": "string" },
+        "knowledgeTag": { "type": "string" },
+        "lessonTitle": { "type": "string" },
+        "chapter": { "type": "string" },
+        "homeworkDesc": { "type": "string" }
+      },
+      "required": ["classId", "date"]
+    },
+    "grades": {
+      "title": "Grades",
+      "description": "Session attendance and test grades for students",
+      "properties": {
+        "sessionId": { "type": "string" },
+        "studentId": { "type": "string" },
+        "attendance": { "type": "string" },
+        "homeworkScore": { "type": "number" },
+        "testScore": { "type": "number" },
+        "note": { "type": "string" }
+      },
+      "required": ["sessionId", "studentId"]
+    }
+  }
+}
