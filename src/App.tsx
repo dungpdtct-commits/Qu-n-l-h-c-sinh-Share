@@ -21,9 +21,11 @@ import { StudentRoster } from './components/StudentRoster';
 import { AuditAndReports } from './components/AuditAndReports';
 import { SettingsModal } from './components/SettingsModal';
 import { useFirestore } from './hooks/useFirestore';
+import { useCloudSync } from './hooks/useCloudSync';
 import { useAuth } from './lib/AuthContext';
 import { Loader2 } from 'lucide-react';
 import { QuotaBanner } from './components/QuotaBanner';
+import { CloudSyncStatusModal } from './components/CloudSyncStatusModal';
 import { sortStudentsByName } from './utils/sortUtils';
 
 export default function App() {
@@ -45,6 +47,10 @@ export default function App() {
   const [userApiKey, setUserApiKey] = useState('');
 
   const { user, loading: authLoading } = useAuth();
+  const { isSyncing, syncStatus, pullFromCloud } = useCloudSync();
+
+  // Cloud Sync Inspector Modal State
+  const [isCloudSyncModalOpen, setIsCloudSyncModalOpen] = useState(false);
 
   // Selected Class ID for Grade Entry shortcut
   const [gradeEntryClassId, setGradeEntryClassId] = useState<string | undefined>(undefined);
@@ -112,6 +118,7 @@ export default function App() {
         onRoleChange={setCurrentRole}
         p1WarningCount={p1Count}
         onOpenWarningCenter={() => setActiveTab('warnings')}
+        onOpenCloudSyncModal={() => setIsCloudSyncModalOpen(true)}
         theme={theme}
         onToggleTheme={handleToggleTheme}
         searchQuery={searchQuery}
@@ -135,6 +142,11 @@ export default function App() {
                 setActiveResolveWarning(w);
                 setActiveTab('warnings');
               }}
+              isLoadingData={isInitializing}
+              isSyncing={isSyncing}
+              syncStatus={syncStatus}
+              onPullFromCloud={pullFromCloud}
+              onInspectCloud={() => setIsCloudSyncModalOpen(true)}
             />
           )}
 
@@ -181,6 +193,7 @@ export default function App() {
               classes={classes}
               currentRole={currentRole}
               onRefresh={() => {}}
+              isLoadingData={isInitializing}
             />
           )}
 
@@ -199,6 +212,12 @@ export default function App() {
           )}
         </main>
       </div>
+
+      {/* Cloud Sync & Storage Inspection Modal */}
+      <CloudSyncStatusModal
+        isOpen={isCloudSyncModalOpen}
+        onClose={() => setIsCloudSyncModalOpen(false)}
+      />
     </div>
   );
 }

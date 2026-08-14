@@ -1,7 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { Student, StudentStatus, ClassItem, StudentSession, Session, Warning } from '../types';
-import { db, deleteStudent } from '../db/dexie';
+import { db, deleteStudent, recordDeletionTombstone } from '../db/dexie';
 import { sortStudentsByName } from '../utils/sortUtils';
 import { doc } from 'firebase/firestore';
 import { db as firestoreDb } from '../lib/firebase';
@@ -51,6 +51,7 @@ interface StudentRosterProps {
   classes: ClassItem[];
   currentRole?: UserRole;
   onRefresh: () => void;
+  isLoadingData?: boolean;
 }
 
 export const StudentRoster: React.FC<StudentRosterProps> = ({
@@ -58,6 +59,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
   classes,
   currentRole = 'Teacher',
   onRefresh,
+  isLoadingData = false,
 }) => {
   const isAdmin = currentRole === 'Teacher';
   const [statusFilter, setStatusFilter] = useState<StudentStatus | 'all'>('studying');
@@ -176,8 +178,8 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
         category = 'Geometry';
       }
 
-      const hasValidTest = typeof ss.test_score === 'number' && ss.test_score > 0;
-      const hasValidHw = typeof ss.homework_score === 'number' && ss.homework_submitted !== false && !ss.late_submit;
+      const hasValidTest = typeof ss.test_score === 'number' && ss.test_score >= 0;
+      const hasValidHw = !(ss.exempt || ss.exempt_homework) && typeof ss.homework_score === 'number' && ss.homework_score >= 0;
 
       if (!hasValidTest && !hasValidHw) {
         return;
@@ -210,9 +212,12 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
   const [classFilter, setClassFilter] = useState<string>('all'); // 'all' or class.id
 
   const availableClassesForFilter = useMemo(() => {
-    if (gradeFilter === 'all') return classes;
+    const validClasses = (classes || []).filter(
+      (c) => c && c.id && typeof c.class_name === 'string' && c.class_name.trim() !== ''
+    );
+    if (gradeFilter === 'all') return validClasses;
     const gNum = Number(gradeFilter);
-    return classes.filter((c) => Number(c.grade_level) === gNum);
+    return validClasses.filter((c) => Number(c.grade_level) === gNum);
   }, [classes, gradeFilter]);
 
   const handleGradeFilterChange = (newGrade: string) => {
@@ -604,14 +609,18 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
               <select
                 value={classFilter}
                 onChange={(e) => setClassFilter(e.target.value)}
-                className="bg-transparent font-bold text-xs text-slate-900 dark:text-slate-100 outline-none cursor-pointer max-w-[150px]"
+                className="bg-transparent font-bold text-xs text-slate-900 dark:text-slate-100 outline-none cursor-pointer max-w-[160px] truncate"
               >
-                <option value="all">Tất cả Lớp học</option>
-                {availableClassesForFilter.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    Lớp {c.class_name}
-                  </option>
-                ))}
+                <option value="all">Tất cả Lớp học ({availableClassesForFilter.length})</option>
+                {availableClassesForFilter.map((c) => {
+                  const classNameClean = c.class_name?.trim() || `Lớp chưa đặt tên (#${String(c.id).slice(0, 4)})`;
+                  const isArchived = c.status === 'archived';
+                  return (
+                    <option key={c.id} value={c.id}>
+                      Lớp {classNameClean} {isArchived ? '(Đã lưu trữ)' : ''}
+                    </option>
+                  );
+                })}
               </select>
             </div>
 
@@ -664,9 +673,67 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
       {/* Student List Grid (Scrollable Container) */}
       <div className="max-h-[calc(100vh-270px)] min-h-[350px] overflow-y-auto pr-1 pb-6">
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {filteredStudents.length === 0 ? (
-            <div className="col-span-full p-8 text-center text-xs text-slate-500 bg-white dark:bg-slate-900 rounded-2xl border border-dashed border-slate-300 dark:border-slate-800">
-              Không tìm thấy học sinh nào phù hợp với bộ lọc hiện tại!
+          {isLoadingData ? (
+            Array.from({ length: 6 }).map((_, idx) => (
+              <div key={idx} className="bg-white dark:bg-slate-900 p-4 rounded-2xl border border-slate-200 dark:border-slate-800 animate-pulse space-y-3">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-full bg-slate-200 dark:bg-slate-800" />
+                  <div className="space-y-1.5 flex-1">
+                    <div className="h-4 w-28 bg-slate-200 dark:bg-slate-800 rounded" />
+                    <div className="h-3 w-16 bg-slate-200 dark:bg-slate-800 rounded" />
+                  </div>
+                </div>
+                <div className="h-3 w-3/4 bg-slate-200 dark:bg-slate-800 rounded" />
+                <div className="h-3 w-1/2 bg-slate-200 dark:bg-slate-800 rounded" />
+              </div>
+            ))
+          ) : students.length === 0 ? (
+            <div className="col-span-full p-10 text-center bg-white dark:bg-slate-900 rounded-2xl border border-dashed border-slate-200 dark:border-slate-800 space-y-3">
+              <div className="w-12 h-12 mx-auto rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center text-slate-400">
+                <Users className="w-6 h-6" />
+              </div>
+              <div>
+                <p className="text-sm font-bold text-slate-800 dark:text-slate-200">
+                  Chưa có dữ liệu học sinh trong hệ thống
+                </p>
+                <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
+                  Hệ thống hiện tại chưa ghi nhận học sinh nào. Bạn có thể thêm học sinh mới hoặc kiểm tra lại kết nối đồng bộ Cloud.
+                </p>
+              </div>
+              {(isAdmin || currentRole === 'TA') && (
+                <button
+                  onClick={handleOpenAddModal}
+                  className="px-4 py-2 bg-emerald-600 text-white hover:bg-emerald-700 text-xs font-bold rounded-xl shadow-xs transition-all inline-flex items-center gap-2 mt-2"
+                >
+                  <Plus className="w-4 h-4" />
+                  <span>Thêm Học Sinh Mới</span>
+                </button>
+              )}
+            </div>
+          ) : filteredStudents.length === 0 ? (
+            <div className="col-span-full p-8 text-center bg-white dark:bg-slate-900 rounded-2xl border border-dashed border-slate-200 dark:border-slate-800 space-y-3">
+              <div className="w-10 h-10 mx-auto rounded-full bg-amber-50 dark:bg-amber-950/40 text-amber-600 dark:text-amber-400 flex items-center justify-center">
+                <Search className="w-5 h-5" />
+              </div>
+              <div>
+                <p className="text-xs font-bold text-slate-800 dark:text-slate-200">
+                  Không tìm thấy học sinh nào phù hợp với bộ lọc
+                </p>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Đang lọc theo: {statusFilter !== 'all' ? `Trạng thái (${statusFilter})` : ''} {gradeFilter !== 'all' ? `Khối ${gradeFilter}` : ''} {classFilter !== 'all' ? `Lớp selected` : ''} {searchQuery ? `Từ khóa "${searchQuery}"` : ''}
+                </p>
+              </div>
+              <button
+                onClick={() => {
+                  setGradeFilter('all');
+                  setClassFilter('all');
+                  setSearchQuery('');
+                  setStatusFilter('all');
+                }}
+                className="px-3 py-1.5 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-200 text-xs font-bold rounded-xl transition-all"
+              >
+                Xóa tất cả bộ lọc
+              </button>
             </div>
           ) : (
             filteredStudents.map((st) => (
@@ -1557,6 +1624,7 @@ export const StudentRoster: React.FC<StudentRosterProps> = ({
                                     if (confirm(`CẢNH BÁO: Bạn có chắc chắn muốn xóa VĨNH VIỄN mối liên kết lớp của ${viewingStudent.full_name} với lớp ${c.class_name}?\nHành động này sẽ xóa hẳn dòng liên kết trong database. Để lưu vết chuyển lớp, khuyến khích sử dụng nút "Rút lui an toàn".`)) {
                                       await db.class_students.delete(cs.id!);
                                       if (firestoreDb) {
+                                        await recordDeletionTombstone(String(cs.id!), 'class_students');
                                         await safeDeleteDoc(doc(firestoreDb, 'class_students', String(cs.id!)));
                                       }
                                       await db.audit_logs.add({

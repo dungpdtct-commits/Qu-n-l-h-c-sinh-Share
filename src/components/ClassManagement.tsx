@@ -4,7 +4,7 @@ import { doc } from 'firebase/firestore';
 import { db as firestoreDb } from '../lib/firebase';
 import { safeSetDoc, safeDeleteDoc } from '../lib/firestoreUtils';
 import { ClassItem, GradeLevel, ClassStatus, ClassType, UserRole, Session, Warning, StudentSession } from '../types';
-import { db } from '../db/dexie';
+import { db, recordDeletionTombstone } from '../db/dexie';
 import { logAudit } from '../utils/auditLogger';
 import { compareVietnameseNames } from '../utils/sortUtils';
 import * as XLSX from 'xlsx';
@@ -261,8 +261,13 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
 
     const classIdStr = String(deletingClass.id!);
     const classSessions = await db.sessions.where('class_id').equals(deletingClass.id!).toArray();
+    const classStudentLinks = await db.class_students.where('class_id').equals(deletingClass.id!).toArray();
+    const classWarnings = await db.warnings.where('class_id').equals(deletingClass.id!).toArray();
+
     const sessionIds = classSessions.map((s) => s.id!).filter(Boolean);
+    let classStudentSessions: StudentSession[] = [];
     if (sessionIds.length > 0) {
+      classStudentSessions = await db.student_sessions.where('session_id').anyOf(sessionIds).toArray();
       await db.student_sessions.where('session_id').anyOf(sessionIds).delete();
     }
 
@@ -272,7 +277,32 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
     await db.warnings.where('class_id').equals(deletingClass.id!).delete();
 
     if (firestoreDb) {
+      await recordDeletionTombstone(classIdStr, 'classes');
       await safeDeleteDoc(doc(firestoreDb, 'classes', classIdStr));
+      for (const cs of classStudentLinks) {
+        if (cs.id) {
+          await recordDeletionTombstone(String(cs.id), 'class_students');
+          await safeDeleteDoc(doc(firestoreDb, 'class_students', String(cs.id)));
+        }
+      }
+      for (const s of classSessions) {
+        if (s.id) {
+          await recordDeletionTombstone(String(s.id), 'sessions');
+          await safeDeleteDoc(doc(firestoreDb, 'sessions', String(s.id)));
+        }
+      }
+      for (const ss of classStudentSessions) {
+        if (ss.id) {
+          await recordDeletionTombstone(String(ss.id), 'student_sessions');
+          await safeDeleteDoc(doc(firestoreDb, 'student_sessions', String(ss.id)));
+        }
+      }
+      for (const w of classWarnings) {
+        if (w.id) {
+          await recordDeletionTombstone(String(w.id), 'warnings');
+          await safeDeleteDoc(doc(firestoreDb, 'warnings', String(w.id)));
+        }
+      }
     }
 
     await logAudit(currentRole as UserRole, 'Xóa lớp học', `Xóa vĩnh viễn lớp ${deletingClass.class_name}`);
@@ -1359,10 +1389,10 @@ export const ClassManagement: React.FC<ClassManagementProps> = ({
                             return compareVietnameseNames(stA?.full_name || '', stB?.full_name || '');
                           });
 
-                          const presentCount = sessStudScores.filter((ss) => ss.attendance === 'present' || ss.attendance === 'late').length;
+                          const presentCount = sessStudScores.filter((ss) => !ss.attendance || ss.attendance === 'present' || ss.attendance === 'late').length;
                           const totalCount = validClassStudentIds.size > 0 ? validClassStudentIds.size : sessStudScores.length;
                           
-                          const homeworks = sessStudScores.filter((ss) => !(ss.exempt || ss.exempt_homework) && ss.homework_submitted !== false && !ss.late_submit && typeof ss.homework_score === 'number' && ss.homework_score >= 0);
+                          const homeworks = sessStudScores.filter((ss) => !(ss.exempt || ss.exempt_homework) && typeof ss.homework_score === 'number' && ss.homework_score >= 0);
                           const avgHW = homeworks.length > 0 ? (homeworks.reduce((sum, h) => sum + (h.homework_score || 0), 0) / homeworks.length).toFixed(1) : 'N/A';
                           
                           const tests = sessStudScores.filter((ss) => !(ss.exempt || ss.exempt_test) && (ss.attendance === 'present' || ss.attendance === 'late') && typeof ss.test_score === 'number' && ss.test_score >= 0);

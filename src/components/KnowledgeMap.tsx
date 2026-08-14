@@ -111,11 +111,12 @@ export const KnowledgeMap: React.FC<KnowledgeMapProps> = ({
         : [];
 
       const calculatedData = filteredTags.map((tag) => {
-        // Find sessions linked to this tag ID or matching tag_name
+        // Find sessions linked to this tag ID or matching tag_name or test_knowledge_tag
         const matchingSessions = allSessions.filter(
           (s) =>
             s.knowledge_tag_id === tag.id ||
-            (s.lesson_title && s.lesson_title.toLowerCase().includes(tag.tag_name.toLowerCase()))
+            (s.lesson_title && s.lesson_title.toLowerCase().includes(tag.tag_name.toLowerCase())) ||
+            (s.test_knowledge_tag && s.test_knowledge_tag !== 'same' && s.test_knowledge_tag.toLowerCase().includes(tag.tag_name.toLowerCase()))
         );
         const matchingSessionIds = matchingSessions.map((s) => s.id!);
 

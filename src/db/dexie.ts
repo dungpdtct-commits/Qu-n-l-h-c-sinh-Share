@@ -1,7 +1,8 @@
 import Dexie, { Table } from 'dexie';
-import { doc } from 'firebase/firestore';
+import { doc, collection, query, where, getDocs } from 'firebase/firestore';
 import { db as firestoreDb } from '../lib/firebase';
-import { safeDeleteDoc } from '../lib/firestoreUtils';
+import { safeDeleteDoc, safeSetDoc, isCloudSyncEnabled, isQuotaExceeded } from '../lib/firestoreUtils';
+import { logSyncActivity } from '../lib/syncActivityLogger';
 import {
   SchoolYear,
   ClassItem,
@@ -16,6 +17,54 @@ import {
   AuditLog,
   Settings,
 } from '../types';
+
+export let isRemoteSyncing = false;
+export function setRemoteSyncing(val: boolean) {
+  isRemoteSyncing = val;
+}
+
+export async function pushSingleDocToFirestore(tableName: string, docId: string | number, data: any, isDelete = false) {
+  if (isRemoteSyncing || !firestoreDb || !docId) return;
+  if (!isCloudSyncEnabled() || isQuotaExceeded()) return;
+
+  try {
+    const dId = String(docId);
+    const docRef = doc(firestoreDb, tableName, dId);
+    if (isDelete) {
+      await safeDeleteDoc(docRef);
+      logSyncActivity({
+        tableName,
+        action: 'push_delete',
+        description: `Đã xóa bản ghi #${dId} trên Cloud`,
+        status: 'success',
+      });
+    } else {
+      const nowISO = new Date().toISOString();
+      const sanitized: any = {};
+      for (const [k, v] of Object.entries(data || {})) {
+        if (v !== undefined) sanitized[k] = v;
+      }
+      sanitized.updated_at = sanitized.updated_at || sanitized.last_updated || nowISO;
+      await safeSetDoc(docRef, sanitized, { merge: true });
+      
+      const label = data?.full_name || data?.class_name || data?.lesson_title || `ID ${dId}`;
+      logSyncActivity({
+        tableName,
+        action: 'push_update',
+        description: `Đã đẩy tức thời (${label}) lên Cloud`,
+        status: 'success',
+      });
+    }
+  } catch (err) {
+    console.warn(`[Instant Push] Failed for ${tableName}/${docId} (will sync on next pass):`, err);
+    logSyncActivity({
+      tableName,
+      action: isDelete ? 'push_delete' : 'push_update',
+      description: `Lỗi đẩy bản ghi #${docId} lên Cloud`,
+      status: 'error',
+    });
+  }
+}
 
 export class SmartEduDatabase extends Dexie {
   school_years!: Table<SchoolYear, string>;
@@ -62,18 +111,166 @@ export class SmartEduDatabase extends Dexie {
 
 export const db = new SmartEduDatabase();
 
-export async function deleteStudent(studentId: string) {
+// Attach Instant Push-on-Write hooks to tables
+const SYNCABLE_TABLES: Array<{ name: string; table: Table<any, any> }> = [
+  { name: 'classes', table: db.classes },
+  { name: 'students', table: db.students },
+  { name: 'class_students', table: db.class_students },
+  { name: 'sessions', table: db.sessions },
+  { name: 'student_sessions', table: db.student_sessions },
+  { name: 'warnings', table: db.warnings },
+  { name: 'knowledge_tags', table: db.knowledge_tags },
+  { name: 'school_years', table: db.school_years },
+  { name: 'settings', table: db.settings },
+  { name: 'knowledge_results', table: db.knowledge_results },
+  { name: 'ai_diagnoses', table: db.ai_diagnoses },
+  { name: 'audit_logs', table: db.audit_logs },
+];
+
+SYNCABLE_TABLES.forEach(({ name, table }) => {
+  if (!table) return;
+  table.hook('creating', function (primKey, obj, trans) {
+    this.onsuccess = function (createdKey) {
+      if (!isRemoteSyncing) {
+        const id = createdKey || primKey || obj.id;
+        pushSingleDocToFirestore(name, id, obj, false);
+      }
+    };
+  });
+  table.hook('updating', function (modifications, primKey, obj, trans) {
+    this.onsuccess = function (updatedObj) {
+      if (!isRemoteSyncing) {
+        const id = primKey || obj.id;
+        pushSingleDocToFirestore(name, id, updatedObj || { ...obj, ...modifications }, false);
+      }
+    };
+  });
+  table.hook('deleting', function (primKey, obj, trans) {
+    this.onsuccess = function () {
+      if (!isRemoteSyncing) {
+        const id = primKey || (obj && obj.id);
+        pushSingleDocToFirestore(name, id, null, true);
+      }
+    };
+  });
+});
+
+export async function recordDeletionTombstone(id: string, tableName: string, studentId?: string) {
+  if (!firestoreDb) return;
+  try {
+    const tombstoneId = `${tableName}_${id}`;
+    const docRef = doc(firestoreDb, 'deleted_records', tombstoneId);
+    await safeSetDoc(docRef, {
+      id: String(id),
+      table_name: tableName,
+      student_id: studentId ? String(studentId) : (tableName === 'students' ? String(id) : null),
+      deleted_at: new Date().toISOString()
+    });
+  } catch (err) {
+    console.warn('[Tombstone] Error recording deletion:', err);
+  }
+}
+
+export async function deleteStudent(studentId: string | number) {
+  const sidStr = String(studentId);
+  const sidNum = Number(studentId);
+  const isNum = !isNaN(sidNum);
+
+  const findRelated = async (table: any) => {
+    const byStr = await table.where('student_id').equals(sidStr).toArray();
+    const byNum = isNum ? await table.where('student_id').equals(sidNum).toArray() : [];
+    const map = new Map<string, any>();
+    [...byStr, ...byNum].forEach(item => map.set(String(item.id), item));
+    return Array.from(map.values());
+  };
+
+  // Collect related records from Dexie before deleting locally
+  const classStudentRecords = await findRelated(db.class_students);
+  const studentSessionRecords = await findRelated(db.student_sessions);
+  const warningRecords = await findRelated(db.warnings);
+  const knowledgeResultRecords = await findRelated(db.knowledge_results);
+  const aiDiagnosisRecords = await findRelated(db.ai_diagnoses);
+
   await db.transaction('rw', [db.students, db.class_students, db.student_sessions, db.warnings, db.knowledge_results, db.ai_diagnoses], async () => {
-    await db.students.delete(studentId);
-    await db.class_students.where('student_id').equals(studentId).delete();
-    await db.student_sessions.where('student_id').equals(studentId).delete();
-    await db.warnings.where('student_id').equals(studentId).delete();
-    await db.knowledge_results.where('student_id').equals(studentId).delete();
-    await db.ai_diagnoses.where('student_id').equals(studentId).delete();
+    await db.students.delete(sidStr);
+    if (isNum) await db.students.delete(sidNum as any);
+
+    const deleteFromTable = async (table: any) => {
+      await table.where('student_id').equals(sidStr).delete();
+      if (isNum) await table.where('student_id').equals(sidNum).delete();
+    };
+
+    await deleteFromTable(db.class_students);
+    await deleteFromTable(db.student_sessions);
+    await deleteFromTable(db.warnings);
+    await deleteFromTable(db.knowledge_results);
+    await deleteFromTable(db.ai_diagnoses);
   });
 
   if (firestoreDb) {
-    await safeDeleteDoc(doc(firestoreDb, 'students', String(studentId)));
+    try {
+      // 1. Write tombstone for student
+      await recordDeletionTombstone(sidStr, 'students', sidStr);
+
+      // 2. Delete main student document from Firestore
+      await safeDeleteDoc(doc(firestoreDb, 'students', sidStr));
+
+      // 3. Delete known explicit IDs on Firestore & write tombstones
+      for (const cs of classStudentRecords) {
+        if (cs.id) {
+          await recordDeletionTombstone(String(cs.id), 'class_students', sidStr);
+          await safeDeleteDoc(doc(firestoreDb, 'class_students', String(cs.id)));
+        }
+      }
+      for (const ss of studentSessionRecords) {
+        if (ss.id) {
+          await recordDeletionTombstone(String(ss.id), 'student_sessions', sidStr);
+          await safeDeleteDoc(doc(firestoreDb, 'student_sessions', String(ss.id)));
+        }
+      }
+      for (const w of warningRecords) {
+        if (w.id) {
+          await recordDeletionTombstone(String(w.id), 'warnings', sidStr);
+          await safeDeleteDoc(doc(firestoreDb, 'warnings', String(w.id)));
+        }
+      }
+      for (const kr of knowledgeResultRecords) {
+        if (kr.id) {
+          await recordDeletionTombstone(String(kr.id), 'knowledge_results', sidStr);
+          await safeDeleteDoc(doc(firestoreDb, 'knowledge_results', String(kr.id)));
+        }
+      }
+      for (const ad of aiDiagnosisRecords) {
+        if (ad.id) {
+          await recordDeletionTombstone(String(ad.id), 'ai_diagnoses', sidStr);
+          await safeDeleteDoc(doc(firestoreDb, 'ai_diagnoses', String(ad.id)));
+        }
+      }
+
+      // 4. Fallback query cleanup on Firestore for student_id matching sidStr
+      const deleteCloudByField = async (colName: string) => {
+        try {
+          const q = query(collection(firestoreDb, colName), where('student_id', '==', sidStr));
+          const snap = await getDocs(q);
+          for (const d of snap.docs) {
+            await recordDeletionTombstone(d.id, colName, sidStr);
+            await safeDeleteDoc(d.ref);
+          }
+        } catch (e) {
+          console.warn(`[deleteStudent] Firestore cleanup error for ${colName}:`, e);
+        }
+      };
+
+      await Promise.all([
+        deleteCloudByField('class_students'),
+        deleteCloudByField('student_sessions'),
+        deleteCloudByField('warnings'),
+        deleteCloudByField('knowledge_results'),
+        deleteCloudByField('ai_diagnoses'),
+      ]);
+    } catch (err) {
+      console.error('[deleteStudent] Error syncing deletions to Firestore:', err);
+    }
   }
 }
 

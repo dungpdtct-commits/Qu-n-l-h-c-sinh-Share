@@ -150,7 +150,7 @@ export async function exportSessionReportPDF(
     const isAttended = !ss.attendance || ss.attendance === 'present' || ss.attendance === 'late';
     if (isAttended) {
       presentCount++;
-      if (selectedSession.has_homework !== false && ss.homework_score !== undefined && ss.homework_submitted !== false && !ss.late_submit) {
+      if (selectedSession.has_homework !== false && !(ss.exempt || ss.exempt_homework) && typeof ss.homework_score === 'number') {
         totalHw += ss.homework_score;
         hwCount++;
       }

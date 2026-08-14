@@ -14,11 +14,11 @@ import {
   Legend,
 } from 'recharts';
 import { ClassItem, Session, Student, StudentSession, AttendanceStatus, KnowledgeTag } from '../types';
-import { db } from '../db/dexie';
+import { db, recordDeletionTombstone } from '../db/dexie';
 import { sortStudentsByName } from '../utils/sortUtils';
-import { doc } from 'firebase/firestore';
+import { doc, writeBatch } from 'firebase/firestore';
 import { db as firestoreDb } from '../lib/firebase';
-import { safeSetDoc, safeDeleteDoc } from '../lib/firestoreUtils';
+import { safeSetDoc, safeDeleteDoc, safeBatchCommit } from '../lib/firestoreUtils';
 import { logAudit } from '../utils/auditLogger';
 import { exportSessionReportPDF } from '../utils/pdfGenerator';
 import { recalculateKnowledgeResultsForClass } from '../utils/knowledgeEngine';
@@ -197,6 +197,14 @@ const addPresetToFormattedComment = (
   return text;
 };
 
+const formatKnowledgeTagLabel = (tag: KnowledgeTag): string => {
+  const categoryPrefix = tag.category === 'Algebra' ? 'Đại số' : 'Hình học';
+  if (tag.tag_name.startsWith('Đại số') || tag.tag_name.startsWith('Hình học')) {
+    return tag.tag_name;
+  }
+  return `${categoryPrefix} ${tag.grade_level} - ${tag.tag_name}`;
+};
+
 export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
   classes,
   selectedClassId,
@@ -205,6 +213,23 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
 }) => {
   const activeClasses = classes.filter((c) => c.status === 'active');
   const currentClass = activeClasses.find((c) => c.id === selectedClassId) || activeClasses[0];
+
+  // Real-time IndexedDB Live Queries for realtime data synchronization
+  const liveKnowledgeTags = useLiveQuery(() => db.knowledge_tags.toArray()) || [];
+
+  const liveSessions = useLiveQuery(
+    () => (currentClass?.id ? db.sessions.where('class_id').equals(currentClass.id).sortBy('session_date') : []),
+    [currentClass?.id]
+  ) || [];
+
+  const liveClassStudents = useLiveQuery(
+    () => (currentClass?.id ? db.class_students.where('class_id').equals(currentClass.id).toArray() : []),
+    [currentClass?.id]
+  ) || [];
+
+  const liveStudents = useLiveQuery(() => db.students.toArray()) || [];
+
+  const liveStudentSessions = useLiveQuery(() => db.student_sessions.toArray()) || [];
 
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<number | undefined>(undefined);
@@ -516,37 +541,47 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
     let pendingTestCount = 0;
     let needSupport = 0;
 
+    const hasTest = selectedSession?.has_test !== false;
+    const hasHw = selectedSession?.has_homework !== false;
+
     students.forEach((st) => {
       const rec = studentSessions[st.id!];
+      // Default to present if record exists or missing
+      const attendance = rec?.attendance;
+      const isAttended = !attendance || attendance === 'present' || attendance === 'late';
+      if (isAttended) present++;
+
       if (!rec) return;
 
       const isHwExempt = rec.exempt || rec.exempt_homework;
       const isTestExempt = rec.exempt || rec.exempt_test;
 
-      const isAttended = rec.attendance === 'present' || rec.attendance === 'late';
-      if (isAttended) present++;
+      // 1. Nộp BTVN: Đã nộp (kể cả nộp muộn), hoặc được Miễn BTVN
+      const isHwSubmitted = isHwExempt || rec.homework_submitted !== false || rec.late_submit === true;
+      if (isAttended && hasHw && isHwSubmitted) {
+        hwDone++;
+      }
 
-      const isHwValid = rec.homework_submitted !== false && !rec.late_submit;
-
-      if (isAttended && (isHwExempt || (isHwValid && typeof rec.homework_score === 'number' && rec.homework_score >= 5))) hwDone++;
-
-      if (isAttended && !isHwExempt && typeof rec.homework_score === 'number' && rec.homework_submitted !== false && !rec.late_submit) {
+      // 2. Điểm TB BTVN: Tất cả điểm số BTVN hợp lệ của học sinh có mặt và không miễn trừ
+      if (isAttended && hasHw && !isHwExempt && typeof rec.homework_score === 'number') {
         totalHw += rec.homework_score;
         hwCount++;
       }
 
-      if (isAttended && !isTestExempt && typeof rec.test_score === 'number') {
-        totalTest += rec.test_score;
-        testCount++;
-      } else if (isAttended && !isTestExempt && (rec.test_score === undefined || rec.test_score === null)) {
-        pendingTestCount++;
+      // 3. Điểm TB Kiểm Tra & Chờ chấm
+      if (isAttended && hasTest && !isTestExempt) {
+        if (typeof rec.test_score === 'number') {
+          totalTest += rec.test_score;
+          testCount++;
+        } else if (rec.test_score === undefined || rec.test_score === null) {
+          pendingTestCount++;
+        }
       }
 
-      if (
-        rec.attendance === 'absent_unexcused' ||
-        (isAttended && !isTestExempt && typeof rec.test_score === 'number' && rec.test_score < 5) ||
-        (isAttended && !isHwExempt && (!isHwValid || (typeof rec.homework_score === 'number' && rec.homework_score < 5)))
-      ) {
+      // 4. Cần hỗ trợ
+      const isHwWeak = hasHw && !isHwExempt && (rec.homework_submitted === false || (typeof rec.homework_score === 'number' && rec.homework_score < 5));
+      const isTestWeak = hasTest && !isTestExempt && typeof rec.test_score === 'number' && rec.test_score < 5;
+      if (attendance === 'absent_unexcused' || (isAttended && (isHwWeak || isTestWeak))) {
         needSupport++;
       }
     });
@@ -554,26 +589,15 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
     return {
       total,
       present,
-      presentPct: Math.round((present / total) * 100),
+      presentPct: total > 0 ? Math.round((present / total) * 100) : 0,
       hwDone,
       hwPct: present > 0 ? Math.round((hwDone / present) * 100) : 0,
       avgHw: hwCount > 0 ? parseFloat((totalHw / hwCount).toFixed(1)) : 0,
       avgTest: testCount > 0 ? parseFloat((totalTest / testCount).toFixed(1)) : 0,
-      pendingTestCount,
+      pendingTestCount: hasTest ? pendingTestCount : 0,
       needSupport,
     };
-  }, [students, studentSessions]);
-
-  // Real-time Knowledge Tags from IndexedDB (synced with Firestore)
-  const liveKnowledgeTags = useLiveQuery(() => db.knowledge_tags.toArray());
-
-  const formatKnowledgeTagLabel = (tag: KnowledgeTag): string => {
-    const categoryPrefix = tag.category === 'Algebra' ? 'Đại số' : 'Hình học';
-    if (tag.tag_name.startsWith('Đại số') || tag.tag_name.startsWith('Hình học')) {
-      return tag.tag_name;
-    }
-    return `${categoryPrefix} ${tag.grade_level} - ${tag.tag_name}`;
-  };
+  }, [students, studentSessions, selectedSession]);
 
   const tagOptions = useMemo(() => {
     if (Array.isArray(liveKnowledgeTags)) {
@@ -647,6 +671,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
   const [newHwDesc, setNewHwDesc] = useState('Làm Bài 1 đến 5 trong Phiếu BTVN');
   const [newKnowledgeTag, setNewKnowledgeTag] = useState('');
   const [newTestKnowledgeTag, setNewTestKnowledgeTag] = useState('same');
+  const [isNewTestTagCustom, setIsNewTestTagCustom] = useState(false);
   const [newHasHomework, setNewHasHomework] = useState(true);
   const [newHasTest, setNewHasTest] = useState(true);
 
@@ -658,8 +683,64 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
   const [editHwDesc, setEditHwDesc] = useState('');
   const [editKnowledgeTag, setEditKnowledgeTag] = useState('');
   const [editTestKnowledgeTag, setEditTestKnowledgeTag] = useState('same');
+  const [isEditTestTagCustom, setIsEditTestTagCustom] = useState(false);
   const [editHasHomework, setEditHasHomework] = useState(true);
   const [editHasTest, setEditHasTest] = useState(true);
+
+  // Helper renderer for Test Knowledge Tag options (combining Same, Past Sessions, and Standard Tags)
+  const renderTestKnowledgeTagOptions = (selectedValue?: string, excludeSessionId?: number) => {
+    const pastSessions = (liveSessions || [])
+      .filter((s) => !excludeSessionId || String(s.id) !== String(excludeSessionId))
+      .sort((a, b) => b.session_date.localeCompare(a.session_date));
+
+    const validTagLabels = tagOptions.map((opt) => opt.label);
+    const pastLessonTitles = pastSessions.map((s) => s.lesson_title);
+
+    const isCustomValue =
+      selectedValue &&
+      selectedValue !== 'same' &&
+      selectedValue !== '__custom__' &&
+      !pastLessonTitles.includes(selectedValue) &&
+      !validTagLabels.includes(selectedValue);
+
+    return (
+      <>
+        <optgroup label="🎯 Mặc định">
+          <option value="same">
+            🎯 Trùng với tên tựa đề bài học hôm nay (chuyên đề buổi này)
+          </option>
+        </optgroup>
+
+        {pastSessions.length > 0 && (
+          <optgroup label="📚 Từ tựa đề các buổi học đã từng diễn ra (Lớp này)">
+            {pastSessions.map((s) => (
+              <option key={`sess_${s.id}`} value={s.lesson_title}>
+                📅 Ngày {s.session_date}: {s.lesson_title}
+              </option>
+            ))}
+          </optgroup>
+        )}
+
+        <optgroup label="🏷️ Danh sách Chuyên đề Toán THCS chuẩn">
+          {tagOptions.map((t) => (
+            <option key={t.id || t.label} value={t.label}>
+              {t.label}
+            </option>
+          ))}
+        </optgroup>
+
+        {isCustomValue && (
+          <optgroup label="📌 Chủ đề tùy chỉnh đang chọn">
+            <option value={selectedValue}>📌 {selectedValue}</option>
+          </optgroup>
+        )}
+
+        <optgroup label="✏️ Tùy chọn mở rộng">
+          <option value="__custom__">✏️ Nhập chủ đề bài kiểm tra khác...</option>
+        </optgroup>
+      </>
+    );
+  };
 
   // Auto-align tag selection state variables when tagOptions change
   useEffect(() => {
@@ -673,27 +754,13 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
       if (!newKnowledgeTag || !validLabels.includes(newKnowledgeTag)) {
         setNewKnowledgeTag(firstLabel);
       }
-      if (
-        newTestKnowledgeTag !== 'same' &&
-        !validLabels.includes(newTestKnowledgeTag)
-      ) {
-        setNewTestKnowledgeTag('same');
-      }
       if (editKnowledgeTag && !validLabels.includes(editKnowledgeTag)) {
         setEditKnowledgeTag(firstLabel);
-      }
-      if (
-        editTestKnowledgeTag !== 'same' &&
-        !validLabels.includes(editTestKnowledgeTag)
-      ) {
-        setEditTestKnowledgeTag('same');
       }
     } else {
       setCurrentKnowledgeTag('');
       setNewKnowledgeTag('');
-      if (newTestKnowledgeTag !== 'same') setNewTestKnowledgeTag('same');
       setEditKnowledgeTag('');
-      if (editTestKnowledgeTag !== 'same') setEditTestKnowledgeTag('same');
     }
   }, [tagOptions]);
 
@@ -704,97 +771,99 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
   // Grid element refs for keyboard focus management
   const cellRefs = useRef<Record<string, HTMLElement | null>>({});
 
-  // Load Sessions for current class
+  // Synchronize liveSessions into component state and select valid session
   useEffect(() => {
-    if (!currentClass?.id) return;
+    setSessions(liveSessions);
+    if (liveSessions.length > 0) {
+      const exists = liveSessions.some((s) => String(s.id) === String(selectedSessionId));
+      if (!exists || selectedSessionId === undefined) {
+        const latestSession = liveSessions[liveSessions.length - 1];
+        setSelectedSessionId(latestSession.id);
+      }
+    } else {
+      setSelectedSessionId(undefined);
+    }
+  }, [liveSessions, selectedSessionId]);
 
-    db.sessions
-      .where('class_id')
-      .equals(currentClass.id)
-      .sortBy('session_date')
-      .then((sList) => {
-        setSessions(sList);
-        if (sList.length > 0) {
-          const latestSession = sList[sList.length - 1];
-          setSelectedSessionId(latestSession.id);
-          if (latestSession.knowledge_tag_id) {
-            const tag = liveKnowledgeTags.find((t) => t.id === latestSession.knowledge_tag_id);
-            if (tag) {
-              setCurrentKnowledgeTag(formatKnowledgeTagLabel(tag));
-            } else if (latestSession.lesson_title.includes('-')) {
-              const parts = latestSession.lesson_title.split('-');
-              if (parts.length > 1) setCurrentKnowledgeTag(parts[0].trim());
-            }
-          } else if (latestSession.lesson_title.includes('-')) {
-            const parts = latestSession.lesson_title.split('-');
-            if (parts.length > 1) setCurrentKnowledgeTag(parts[0].trim());
+  // Synchronize Knowledge Tag label for selected Session
+  useEffect(() => {
+    if (!selectedSessionId || !liveKnowledgeTags) return;
+    const currentSess = liveSessions.find((s) => String(s.id) === String(selectedSessionId));
+    if (!currentSess) return;
+
+    if (currentSess.knowledge_tag_id) {
+      const tag = liveKnowledgeTags.find((t) => t.id === currentSess.knowledge_tag_id);
+      if (tag) {
+        setCurrentKnowledgeTag(formatKnowledgeTagLabel(tag));
+      } else if (currentSess.lesson_title.includes('-')) {
+        const parts = currentSess.lesson_title.split('-');
+        if (parts.length > 1) setCurrentKnowledgeTag(parts[0].trim());
+      }
+    } else if (currentSess.lesson_title.includes('-')) {
+      const parts = currentSess.lesson_title.split('-');
+      if (parts.length > 1) setCurrentKnowledgeTag(parts[0].trim());
+    }
+  }, [selectedSessionId, liveSessions, liveKnowledgeTags]);
+
+  // Synchronize Students & StudentSession scores reactively from IndexedDB/Firestore
+  useEffect(() => {
+    if (!currentClass?.id) {
+      setStudents([]);
+      setStudentSessions({});
+      return;
+    }
+
+    const activeLinks = liveClassStudents.filter((l) => !l.leave_date);
+    const stIds = new Set(activeLinks.map((l) => String(l.student_id)));
+    const validStudents = sortStudentsByName(
+      liveStudents.filter((s) => s.id && stIds.has(String(s.id)) && s.status === 'studying')
+    );
+    setStudents(validStudents);
+
+    if (selectedSessionId) {
+      const sessIdStr = String(selectedSessionId);
+      const scoreRecords = liveStudentSessions.filter(
+        (ss) => String(ss.session_id) === sessIdStr
+      );
+
+      const recordMap: Record<string, StudentSession> = {};
+      validStudents.forEach((st) => {
+        const found = scoreRecords.find((r) => String(r.student_id) === String(st.id));
+        if (found) {
+          let comment = found.custom_comment || '';
+          const isAbsent = typeof found.attendance === 'string' && found.attendance.startsWith('absent');
+          const isHwMissingOrLate = found.homework_submitted === false || found.late_submit === true;
+          const isExemptHW = found.exempt || (found as any).exempt_homework;
+
+          if (isAbsent) {
+            if (!comment) comment = ABSENT_DEFAULT_COMMENT;
+          } else {
+            comment = ensurePresentCommentFormat(comment, isHwMissingOrLate, !!isExemptHW);
           }
+          recordMap[st.id!] = { ...found, custom_comment: comment };
         } else {
-          setSelectedSessionId(undefined);
+          recordMap[st.id!] = {
+            student_id: st.id!,
+            session_id: selectedSessionId,
+            attendance: 'present',
+            homework_score: undefined as any,
+            test_score: undefined as any,
+            homework_submitted: true,
+            late_submit: false,
+            makeup_test: false,
+            exempt: false,
+            quick_preset_comments: [],
+            custom_comment: ensurePresentCommentFormat('', false, false),
+            updated_at: new Date().toISOString(),
+          };
         }
       });
-  }, [currentClass?.id, liveKnowledgeTags]);
-
-  // Load Students and StudentSession scores for selected Session
-  useEffect(() => {
-    if (!currentClass?.id) return;
-
-    db.class_students
-      .where('class_id')
-      .equals(currentClass.id)
-      .toArray()
-      .then(async (links) => {
-        const activeLinks = links.filter((l) => !l.leave_date);
-        const stIds = activeLinks.map((l) => l.student_id);
-        const stList = await db.students.bulkGet(stIds);
-        const validStudents = sortStudentsByName(
-          (stList.filter(Boolean) as Student[]).filter((s) => s.status === 'studying')
-        );
-        setStudents(validStudents);
-
-        if (selectedSessionId) {
-          const allStudSessions = await db.student_sessions.toArray();
-          const scoreRecords = allStudSessions.filter(
-            (ss) => String(ss.session_id) === String(selectedSessionId)
-          );
-
-          const recordMap: Record<string, StudentSession> = {};
-          validStudents.forEach((st) => {
-            const found = scoreRecords.find((r) => String(r.student_id) === String(st.id));
-            if (found) {
-              let comment = found.custom_comment || '';
-              const isAbsent = typeof found.attendance === 'string' && found.attendance.startsWith('absent');
-              const isHwMissingOrLate = found.homework_submitted === false || found.late_submit === true;
-              const isExemptHW = found.exempt || found.exempt_homework;
-
-              if (isAbsent) {
-                if (!comment) comment = ABSENT_DEFAULT_COMMENT;
-              } else {
-                comment = ensurePresentCommentFormat(comment, isHwMissingOrLate, !!isExemptHW);
-              }
-              recordMap[st.id!] = { ...found, custom_comment: comment };
-            } else {
-              recordMap[st.id!] = {
-                student_id: st.id!,
-                session_id: selectedSessionId,
-                attendance: 'present',
-                homework_score: undefined as any,
-                test_score: undefined as any,
-                homework_submitted: true,
-                late_submit: false,
-                makeup_test: false,
-                exempt: false,
-                quick_preset_comments: [],
-                custom_comment: ensurePresentCommentFormat('', false, false),
-                updated_at: new Date().toISOString(),
-              };
-            }
-          });
-          initialStudentSessionsRef.current = JSON.parse(JSON.stringify(recordMap));
-          setStudentSessions(recordMap);
-        }
-      });
-  }, [currentClass?.id, selectedSessionId]);
+      initialStudentSessionsRef.current = JSON.parse(JSON.stringify(recordMap));
+      setStudentSessions(recordMap);
+    } else {
+      setStudentSessions({});
+    }
+  }, [currentClass?.id, selectedSessionId, liveClassStudents, liveStudents, liveStudentSessions]);
 
   // Helper to focus grid cell by row & col
   const focusCell = (row: number, col: number) => {
@@ -1050,20 +1119,28 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
     try {
       const updatedSessions = { ...studentSessions };
 
+      // Pre-fetch existing sessions for this session_id from Dexie in 1 query
+      const existingDbSessions = await db.student_sessions
+        .where('session_id')
+        .equals(selectedSessionId)
+        .toArray();
+      const existingMap = new Map(existingDbSessions.map((s) => [String(s.student_id), s]));
+
+      const docsToBulkPut: any[] = [];
+      const firestorePayloads: any[] = [];
+
       for (const rec of recordsToSave) {
         let finalId = rec.id;
 
         if (!finalId) {
-          const allStudSessions = await db.student_sessions.toArray();
-          const existing = allStudSessions.find(
-            (item) =>
-              String(item.session_id) === String(rec.session_id) &&
-              String(item.student_id) === String(rec.student_id)
-          );
-
+          const existing = existingMap.get(String(rec.student_id));
           if (existing) {
             finalId = existing.id;
           }
+        }
+
+        if (!finalId) {
+          finalId = `ss_${rec.session_id}_${rec.student_id}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
         }
 
         const payload = {
@@ -1071,48 +1148,55 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
           id: finalId,
         };
 
-        if (finalId) {
-          await db.student_sessions.put(payload);
-        } else {
-          const newId = await db.student_sessions.add(payload);
-          payload.id = newId;
-          finalId = newId;
-        }
+        docsToBulkPut.push(payload);
+        firestorePayloads.push(payload);
 
         if (rec.student_id) {
           updatedSessions[rec.student_id] = payload;
         }
+      }
 
-        if (firestoreDb && finalId) {
-          await safeSetDoc(doc(firestoreDb, 'student_sessions', String(finalId)), {
-            ...payload,
-            id: finalId,
-          }, { merge: true });
-        }
+      // 1. Bulk update IndexedDB in 1 atomic transaction
+      if (docsToBulkPut.length > 0) {
+        await db.student_sessions.bulkPut(docsToBulkPut);
+      }
+
+      // 2. Batch write to Firestore in 1 writeBatch HTTP/gRPC call
+      if (firestoreDb && firestorePayloads.length > 0) {
+        const batch = writeBatch(firestoreDb);
+        firestorePayloads.forEach((payload) => {
+          const docRef = doc(firestoreDb, 'student_sessions', String(payload.id));
+          batch.set(docRef, payload, { merge: true });
+        });
+        await safeBatchCommit(batch);
       }
 
       setStudentSessions(updatedSessions);
       initialStudentSessionsRef.current = JSON.parse(JSON.stringify(updatedSessions));
 
-      // 1. Ghi AuditLog ngắn gọn, minh bạch chỉ đúng số lượng học sinh có thay đổi
-      const selectedSess = sessions.find((s) => s.id === selectedSessionId);
-      await logAudit(
-        'TA',
-        'Nhập điểm tốc độ cao',
-        `Lưu bảng điểm cho buổi học "${selectedSess?.lesson_title || selectedSessionId}" (Lớp ${currentClass.class_name}) - Cập nhật ${dirtyRecords.length} học sinh`
-      );
-
-      // 2. Tự động tính toán lại Điểm tích lũy theo Chuyên đề (KnowledgeResult) cho lớp
-      await recalculateKnowledgeResultsForClass(currentClass.id);
-
-      // 3. Tự động kích hoạt Quét Cảnh Báo cho Lớp học
-      await runWarningScanForClass(String(currentClass.id));
-
       setSyncStatus('synced');
       setLastSyncedTime(new Date().toLocaleTimeString('vi-VN'));
       setSaveSuccessMsg(true);
       setTimeout(() => setSaveSuccessMsg(false), 3000);
-      onRefreshData();
+
+      // 3. Asynchronously run secondary tasks (AuditLog, Knowledge Recalculation, Warning Engine) in background
+      // so the UI save finishes instantly (<20ms) for the user!
+      Promise.all([
+        (async () => {
+          const selectedSess = sessions.find((s) => s.id === selectedSessionId);
+          await logAudit(
+            'TA',
+            'Nhập điểm tốc độ cao',
+            `Lưu bảng điểm cho buổi học "${selectedSess?.lesson_title || selectedSessionId}" (Lớp ${currentClass.class_name}) - Cập nhật ${dirtyRecords.length} học sinh`
+          );
+        })(),
+        recalculateKnowledgeResultsForClass(currentClass.id),
+        runWarningScanForClass(String(currentClass.id)),
+      ]).then(() => {
+        onRefreshData();
+      }).catch((err) => {
+        console.warn('Background sync calculations warning:', err);
+      });
     } catch (error) {
       console.error('Error saving grades:', error);
       setSyncStatus('offline');
@@ -1164,6 +1248,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
     setSelectedSessionId(newId);
     setCurrentKnowledgeTag(newKnowledgeTag);
     setNewTestKnowledgeTag('same');
+    setIsNewTestTagCustom(false);
 
     // Refresh session list
     const updatedSessions = await db.sessions
@@ -1206,6 +1291,7 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
     setEditHwDesc(selectedSess.homework_description || '');
     setEditKnowledgeTag(kTag);
     setEditTestKnowledgeTag(selectedSess.test_knowledge_tag || 'same');
+    setIsEditTestTagCustom(false);
     setEditHasHomework(selectedSess.has_homework ?? true);
     setEditHasTest(selectedSess.has_test ?? true);
     setIsEditSessionOpen(true);
@@ -1306,9 +1392,11 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
       await (db.sessions as any).delete(sessIdStr);
 
       if (firestoreDb) {
+        await recordDeletionTombstone(sessIdStr, 'sessions');
         await safeDeleteDoc(doc(firestoreDb, 'sessions', sessIdStr));
         for (const ss of targetStudSess) {
           if (ss.id) {
+            await recordDeletionTombstone(String(ss.id), 'student_sessions');
             await safeDeleteDoc(doc(firestoreDb, 'student_sessions', String(ss.id)));
           }
         }
@@ -2272,13 +2360,44 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
                   Chủ Đề Bài Kiểm Tra Đầu Giờ (Tùy Chọn)
                 </label>
                 <select
-                  value={newTestKnowledgeTag}
-                  onChange={(e) => setNewTestKnowledgeTag(e.target.value)}
+                  value={isNewTestTagCustom ? '__custom__' : newTestKnowledgeTag}
+                  onChange={(e) => {
+                    if (e.target.value === '__custom__') {
+                      setIsNewTestTagCustom(true);
+                      setNewTestKnowledgeTag('');
+                    } else {
+                      setIsNewTestTagCustom(false);
+                      setNewTestKnowledgeTag(e.target.value);
+                    }
+                  }}
                   className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-xs font-bold text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                 >
-                  <option value="same">🎯 Mặc định: Trùng với tên tự đề bài học (chuyên đề hôm nay)</option>
-                  {renderTagOptions(newTestKnowledgeTag)}
+                  {renderTestKnowledgeTagOptions(newTestKnowledgeTag)}
                 </select>
+
+                {isNewTestTagCustom && (
+                  <div className="mt-2 flex items-center gap-2">
+                    <input
+                      type="text"
+                      required
+                      value={newTestKnowledgeTag}
+                      onChange={(e) => setNewTestKnowledgeTag(e.target.value)}
+                      placeholder="Nhập tên chủ đề bài kiểm tra tùy chỉnh..."
+                      className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-xs font-bold text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsNewTestTagCustom(false);
+                        setNewTestKnowledgeTag('same');
+                      }}
+                      className="px-3 py-2 text-xs font-bold text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200 bg-slate-100 dark:bg-slate-800 rounded-xl shrink-0"
+                      title="Hủy nhập tùy chỉnh"
+                    >
+                      Hủy
+                    </button>
+                  </div>
+                )}
               </div>
 
               <div className="flex gap-4">
@@ -2397,13 +2516,44 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
                   Chủ Đề Bài Kiểm Tra Đầu Giờ (Tùy Chọn)
                 </label>
                 <select
-                  value={editTestKnowledgeTag}
-                  onChange={(e) => setEditTestKnowledgeTag(e.target.value)}
+                  value={isEditTestTagCustom ? '__custom__' : editTestKnowledgeTag}
+                  onChange={(e) => {
+                    if (e.target.value === '__custom__') {
+                      setIsEditTestTagCustom(true);
+                      setEditTestKnowledgeTag('');
+                    } else {
+                      setIsEditTestTagCustom(false);
+                      setEditTestKnowledgeTag(e.target.value);
+                    }
+                  }}
                   className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-xs font-bold text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                 >
-                  <option value="same">🎯 Mặc định: Trùng với tên tự đề bài học (chuyên đề hôm nay)</option>
-                  {renderTagOptions(editTestKnowledgeTag)}
+                  {renderTestKnowledgeTagOptions(editTestKnowledgeTag, selectedSessionId)}
                 </select>
+
+                {isEditTestTagCustom && (
+                  <div className="mt-2 flex items-center gap-2">
+                    <input
+                      type="text"
+                      required
+                      value={editTestKnowledgeTag}
+                      onChange={(e) => setEditTestKnowledgeTag(e.target.value)}
+                      placeholder="Nhập tên chủ đề bài kiểm tra tùy chỉnh..."
+                      className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-xs font-bold text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsEditTestTagCustom(false);
+                        setEditTestKnowledgeTag('same');
+                      }}
+                      className="px-3 py-2 text-xs font-bold text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200 bg-slate-100 dark:bg-slate-800 rounded-xl shrink-0"
+                      title="Hủy nhập tùy chỉnh"
+                    >
+                      Hủy
+                    </button>
+                  </div>
+                )}
               </div>
 
               <div className="flex gap-4">

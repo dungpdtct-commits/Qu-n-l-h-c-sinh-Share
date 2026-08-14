@@ -17,13 +17,15 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../lib/AuthContext';
 import { useCloudSync } from '../hooks/useCloudSync';
-import { isQuotaExceeded } from '../lib/firestoreUtils';
+import { isQuotaExceeded, getFirestoreUsage, FIRESTORE_FREE_LIMITS, FirestoreQuotaStats } from '../lib/firestoreUtils';
+import { Gauge } from 'lucide-react';
 
 interface HeaderProps {
   currentRole: UserRole;
   onRoleChange: (role: UserRole) => void;
   p1WarningCount: number;
   onOpenWarningCenter: () => void;
+  onOpenCloudSyncModal: () => void;
   theme: 'light' | 'dark';
   onToggleTheme: () => void;
   searchQuery: string;
@@ -35,6 +37,7 @@ export const Header: React.FC<HeaderProps> = ({
   onRoleChange,
   p1WarningCount,
   onOpenWarningCenter,
+  onOpenCloudSyncModal,
   theme,
   onToggleTheme,
   searchQuery,
@@ -43,6 +46,23 @@ export const Header: React.FC<HeaderProps> = ({
   const { user, loading, signIn, signOut } = useAuth();
   const { isSyncing, syncStatus, pushToCloud, pullFromCloud } = useCloudSync();
   const quotaExceeded = isQuotaExceeded();
+  const [usageStats, setUsageStats] = React.useState<FirestoreQuotaStats>(getFirestoreUsage());
+
+  React.useEffect(() => {
+    const handleUsageUpdate = (e: any) => {
+      if (e?.detail) {
+        setUsageStats(e.detail);
+      } else {
+        setUsageStats(getFirestoreUsage());
+      }
+    };
+    window.addEventListener('firestore-usage-updated', handleUsageUpdate);
+    return () => {
+      window.removeEventListener('firestore-usage-updated', handleUsageUpdate);
+    };
+  }, []);
+
+  const writePercent = ((usageStats.writes / FIRESTORE_FREE_LIMITS.writes) * 100).toFixed(1);
 
   return (
     <header id="app-header" className="sticky top-0 z-30 bg-white/90 dark:bg-slate-900/90 backdrop-blur-md border-b border-slate-200 dark:border-slate-800 px-4 lg:px-6 py-3 transition-colors">
@@ -79,38 +99,50 @@ export const Header: React.FC<HeaderProps> = ({
 
         {/* Right: Role Switcher & Action Indicators */}
         <div className="flex items-center gap-2.5 w-full sm:w-auto justify-end">
-          {/* Firestore Sync Indicator */}
-          {syncStatus ? (
-            <div className="hidden lg:flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-[10px] font-bold bg-amber-50 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
-              {isSyncing && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-              <span>{syncStatus}</span>
-            </div>
-          ) : quotaExceeded ? (
-            <div className="hidden lg:flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-[10px] font-bold bg-amber-50 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300 border border-amber-200 dark:border-amber-800" title="Hệ thống đang hoạt động ở chế độ Offline (IndexedDB) cực kỳ an toàn do Cloud đã đạt giới hạn trong ngày.">
-              <span className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0 animate-pulse" />
-              <span>Offline (Đạt giới hạn Cloud)</span>
-            </div>
-          ) : (
-            <div className="hidden lg:flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-[10px] font-bold bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800" title="Cơ sở dữ liệu hoạt động trực tiếp trên thiết bị (IndexedDB) cực kỳ an toàn">
-              <CloudCheck className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
-              <span>Cơ sở dữ liệu cục bộ</span>
-            </div>
-          )}
+          {/* Firestore Sync Indicator & Inspection Trigger */}
+          <button
+            onClick={onOpenCloudSyncModal}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-emerald-50 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 hover:bg-emerald-100 dark:hover:bg-emerald-900/60 transition-all cursor-pointer shadow-2xs"
+            title="Bấm để mở Trung tâm Giám sát Đồng bộ Đám mây & Xem chi tiết dữ liệu & hạn mức"
+          >
+            {isSyncing ? (
+              <>
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-600 dark:text-emerald-400" />
+                <span className="hidden sm:inline">Đang đẩy Cloud...</span>
+              </>
+            ) : quotaExceeded ? (
+              <>
+                <span className="w-2 h-2 rounded-full bg-amber-500 shrink-0 animate-pulse" />
+                <span className="hidden sm:inline">Offline (Hạn ngạch Cloud)</span>
+              </>
+            ) : (
+              <>
+                <CloudCheck className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+                <span className="hidden lg:inline">Cloud Live:</span>
+                <span className="font-bold text-emerald-700 dark:text-emerald-300">
+                  {usageStats.writes}/20k
+                </span>
+                <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-emerald-200/80 dark:bg-emerald-900 text-emerald-800 dark:text-emerald-200 font-extrabold hidden sm:inline">
+                  {writePercent}%
+                </span>
+              </>
+            )}
+          </button>
 
-          {/* Sync Buttons */}
+          {/* Sync Quick Action Buttons */}
           {user && !isSyncing && (
              <div className="flex items-center p-1 bg-slate-100 dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700">
                <button
                  onClick={pushToCloud}
                  className="flex items-center justify-center p-1.5 text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-950/50 rounded-lg transition-colors"
-                 title="Đẩy dữ liệu lên Cloud"
+                 title="Đẩy thay đổi lên Cloud ngay (Delta Push)"
                >
                  <UploadCloud className="w-4 h-4" />
                </button>
                <button
                  onClick={pullFromCloud}
                  className="flex items-center justify-center p-1.5 text-sky-600 hover:bg-sky-50 dark:hover:bg-sky-950/50 rounded-lg transition-colors"
-                 title="Tải dữ liệu từ Cloud"
+                 title="Tải dữ liệu từ Cloud về"
                >
                  <DownloadCloud className="w-4 h-4" />
                </button>

@@ -1,9 +1,65 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { collection, getDocs, writeBatch, doc, onSnapshot, disableNetwork } from 'firebase/firestore';
+import { collection, getDocs, writeBatch, doc, onSnapshot, disableNetwork, enableNetwork } from 'firebase/firestore';
 import { db as firestoreDb } from '../lib/firebase';
-import { db } from '../db/dexie';
+import { db, setRemoteSyncing } from '../db/dexie';
 import { useAuth } from '../lib/AuthContext';
-import { isQuotaExceeded, markQuotaExceeded, isQuotaError, isCloudSyncEnabled } from '../lib/firestoreUtils';
+import { isQuotaExceeded, markQuotaExceeded, isQuotaError, isCloudSyncEnabled, trackFirestoreUsage } from '../lib/firestoreUtils';
+import { logSyncActivity } from '../lib/syncActivityLogger';
+
+const LAST_SYNC_KEY = 'last_successful_sync_time';
+
+// Helper function to prevent any async promise from hanging indefinitely
+function withTimeout<T>(promise: Promise<T>, ms: number, errorMessage: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(errorMessage));
+    }, ms);
+
+    promise
+      .then((res) => {
+        clearTimeout(timer);
+        resolve(res);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+
+function getItemTimestamp(item: any): number {
+  const ts = item.updated_at || item.created_at || item.last_updated || item.timestamp;
+  if (!ts) return Infinity;
+  if (typeof ts === 'number') return ts;
+  const parsed = new Date(ts).getTime();
+  return isNaN(parsed) ? Infinity : parsed;
+}
+
+export const purgeStudentCascade = async (studentId: string | number) => {
+  const sidStr = String(studentId);
+  const sidNum = Number(studentId);
+  const isNum = !isNaN(sidNum);
+
+  try {
+    await db.transaction('rw', [db.students, db.class_students, db.student_sessions, db.warnings, db.knowledge_results, db.ai_diagnoses], async () => {
+      await db.students.delete(sidStr);
+      if (isNum) await db.students.delete(sidNum as any);
+
+      const delByField = async (table: any) => {
+        await table.where('student_id').equals(sidStr).delete();
+        if (isNum) await table.where('student_id').equals(sidNum).delete();
+      };
+
+      await delByField(db.class_students);
+      await delByField(db.student_sessions);
+      await delByField(db.warnings);
+      await delByField(db.knowledge_results);
+      await delByField(db.ai_diagnoses);
+    });
+  } catch (err) {
+    console.warn(`[purgeStudentCascade] Error deleting student ${studentId}:`, err);
+  }
+};
 
 export const useCloudSync = () => {
   const [isSyncing, setIsSyncing] = useState(false);
@@ -11,42 +67,77 @@ export const useCloudSync = () => {
   const { user } = useAuth();
   
   // Keep a ref to the latest pushToCloud to use in event listeners
-  const pushToCloudRef = useRef<() => Promise<void>>();
+  const pushToCloudRef = useRef<(forceAll?: boolean) => Promise<void>>();
 
-  const pushToCloud = useCallback(async () => {
+  // Safety watchdog: If isSyncing stays true for more than 15s without resolving, force reset
+  useEffect(() => {
+    if (!isSyncing) return;
+    const watchdogTimer = setTimeout(() => {
+      console.warn('[Cloud Sync] Đồng bộ vượt quá 15 giây, tự động giải phóng trạng thái giao diện.');
+      setIsSyncing(false);
+      setSyncStatus('Đồng bộ mất nhiều thời gian do mạng, dữ liệu vẫn được lưu 100% cục bộ.');
+      setTimeout(() => setSyncStatus(null), 4000);
+    }, 15000);
+
+    return () => clearTimeout(watchdogTimer);
+  }, [isSyncing]);
+
+  const pushToCloud = useCallback(async (forceAll = false) => {
     if (!isCloudSyncEnabled()) {
       setSyncStatus('Chế độ Offline (Đồng bộ đám mây đang tắt)');
-      return;
-    }
-    if (!user) {
-      setSyncStatus('Lỗi: Cần đăng nhập để đồng bộ');
+      setTimeout(() => setSyncStatus(null), 2500);
       return;
     }
     if (isQuotaExceeded()) {
       setSyncStatus('Chế độ Offline (Hết hạn ngạch Cloud)');
+      setTimeout(() => setSyncStatus(null), 2500);
       return;
     }
+
+    const lastSyncTs = localStorage.getItem(LAST_SYNC_KEY);
+    const lastSyncTime = lastSyncTs ? new Date(lastSyncTs).getTime() : 0;
+    const isDelta = !forceAll && lastSyncTime > 0;
+    const deltaThreshold = isDelta ? lastSyncTime - 5000 : 0;
+
     setIsSyncing(true);
-    setSyncStatus('Đang đẩy dữ liệu lên Cloud...');
+    setSyncStatus(isDelta ? 'Đang đồng bộ thay đổi mới (Delta)...' : 'Đang đẩy toàn bộ dữ liệu lên Cloud...');
 
     try {
-      // Delta Sync: Only push modified or newly created documents
-      const lastSyncTimeStr = localStorage.getItem('last_successful_sync_time');
-      const lastSyncTime = lastSyncTimeStr ? new Date(lastSyncTimeStr).getTime() : 0;
-      const currentSyncStartTime = new Date().toISOString();
+      try {
+        await withTimeout(enableNetwork(firestoreDb), 3000, 'Không thể kết nối mạng Firestore');
+      } catch (_) {}
 
-      const getItemTimestamp = (item: any) => {
-        const times = [
-          item.updated_at,
-          item.last_updated,
-          item.created_at,
-          item.join_date,
-          item.leave_date,
-        ].map(t => t ? new Date(t).getTime() : 0);
-        return Math.max(0, ...times.filter(t => !isNaN(t)));
+      // 1. Fetch tombstones to prevent pushing previously deleted records with timeout
+      let deletedIds = new Set<string>();
+      let deletedStudentIds = new Set<string>();
+      try {
+        const deletedSnap = await withTimeout(
+          getDocs(collection(firestoreDb, 'deleted_records')),
+          6000,
+          'Quá thời gian tải danh sách đã xóa'
+        );
+        trackFirestoreUsage('reads', deletedSnap.size || 1);
+        deletedSnap.docs.forEach(docSnap => {
+          const d = docSnap.data();
+          if (d.id) deletedIds.add(String(d.id));
+          if (d.student_id) deletedStudentIds.add(String(d.student_id));
+        });
+      } catch (err) {
+        console.warn('[Cloud Sync] Bỏ qua kiểm tra tombstones (timeout/offline):', err);
+      }
+
+      // Purge any local zombie records matching tombstones first
+      for (const delSid of deletedStudentIds) {
+        await purgeStudentCascade(delSid);
+      }
+
+      const isRecordDeleted = (item: any) => {
+        const itemId = String(item.id || '');
+        const itemStudentId = String(item.student_id || '');
+        return deletedIds.has(itemId) || (itemStudentId && deletedStudentIds.has(itemStudentId));
       };
 
-      // Get all local data
+      // Get all local data from Dexie after tombstone purge
       const classes = await db.classes.toArray();
       const students = await db.students.toArray();
       const classStudents = await db.class_students.toArray();
@@ -54,39 +145,59 @@ export const useCloudSync = () => {
       const studentSessions = await db.student_sessions.toArray();
       const warnings = await db.warnings.toArray();
       const knowledgeTags = await db.knowledge_tags.toArray();
+      const schoolYears = await db.school_years.toArray();
+      const settings = await db.settings.toArray();
+      const knowledgeResults = await db.knowledge_results.toArray();
+      const aiDiagnoses = await db.ai_diagnoses.toArray();
+      const auditLogs = await db.audit_logs.toArray();
 
-      const filteredClasses = classes.filter(item => getItemTimestamp(item) > lastSyncTime);
-      const filteredStudents = students.filter(item => getItemTimestamp(item) > lastSyncTime);
-      const filteredClassStudents = classStudents.filter(item => getItemTimestamp(item) > lastSyncTime);
-      const filteredSessions = sessions.filter(item => getItemTimestamp(item) > lastSyncTime);
-      const filteredStudentSessions = studentSessions.filter(item => getItemTimestamp(item) > lastSyncTime);
-      const filteredWarnings = warnings.filter(item => getItemTimestamp(item) > lastSyncTime);
-      const filteredKnowledgeTags = knowledgeTags
-        .filter(item => getItemTimestamp(item) > lastSyncTime)
-        .map(tag => ({
-          ...tag,
-          reference_link: tag.reference_link || ''
-        }));
-
-      const totalUpdatesCount = 
-        filteredClasses.length +
-        filteredStudents.length +
-        filteredClassStudents.length +
-        filteredSessions.length +
-        filteredStudentSessions.length +
-        filteredWarnings.length +
-        filteredKnowledgeTags.length;
-
-      if (totalUpdatesCount === 0) {
-        setSyncStatus('Dữ liệu đã đồng bộ (Không có thay đổi)');
-        // Update anyway to prevent checking old records next time
-        localStorage.setItem('last_successful_sync_time', currentSyncStartTime);
-        setIsSyncing(false);
-        setTimeout(() => setSyncStatus(null), 3000);
-        return;
+      // Clean up individual deleted records locally
+      for (const st of students) {
+        if (isRecordDeleted(st)) await purgeStudentCascade(st.id);
+      }
+      for (const cs of classStudents) {
+        if (isRecordDeleted(cs)) await db.class_students.delete(cs.id);
+      }
+      for (const ss of studentSessions) {
+        if (isRecordDeleted(ss)) await db.student_sessions.delete(ss.id);
+      }
+      for (const w of warnings) {
+        if (isRecordDeleted(w)) await db.warnings.delete(w.id);
       }
 
-      const batch = writeBatch(firestoreDb);
+      // Prepare items to push (filter out deleted items & apply delta filter if applicable)
+      const allOperations: { tableName: string; item: any }[] = [];
+
+      const addTableItems = (tableName: string, items: any[]) => {
+        items.forEach(item => {
+          if (item && item.id && !isRecordDeleted(item)) {
+            if (!isDelta || getItemTimestamp(item) >= deltaThreshold) {
+              allOperations.push({ tableName, item });
+            }
+          }
+        });
+      };
+
+      addTableItems('classes', classes);
+      addTableItems('students', students);
+      addTableItems('class_students', classStudents);
+      addTableItems('sessions', sessions);
+      addTableItems('student_sessions', studentSessions);
+      addTableItems('warnings', warnings);
+      addTableItems('knowledge_tags', knowledgeTags);
+      addTableItems('school_years', schoolYears);
+      addTableItems('settings', settings);
+      addTableItems('knowledge_results', knowledgeResults);
+      addTableItems('ai_diagnoses', aiDiagnoses);
+      addTableItems('audit_logs', auditLogs);
+
+      if (allOperations.length === 0) {
+        setSyncStatus('Dữ liệu đã đồng bộ mới nhất');
+        localStorage.setItem(LAST_SYNC_KEY, new Date().toISOString());
+        setIsSyncing(false);
+        setTimeout(() => setSyncStatus(null), 2500);
+        return;
+      }
 
       const sanitizeData = (obj: any) => {
         return Object.entries(obj).reduce((acc, [key, value]) => {
@@ -97,38 +208,46 @@ export const useCloudSync = () => {
         }, {} as any);
       };
 
-      const pushTable = (tableName: string, data: any[]) => {
-        data.forEach(item => {
-          if (item && item.id) {
-            const docRef = doc(collection(firestoreDb, tableName), String(item.id));
-            batch.set(docRef, sanitizeData(item), { merge: true });
-          }
+      // Firestore writeBatch limit is 500 operations.
+      // Chunk all operations into batches of max 400 with strict timeout on commit.
+      const BATCH_SIZE = 400;
+      for (let i = 0; i < allOperations.length; i += BATCH_SIZE) {
+        const chunk = allOperations.slice(i, i + BATCH_SIZE);
+        const batch = writeBatch(firestoreDb);
+        chunk.forEach(({ tableName, item }) => {
+          const docRef = doc(collection(firestoreDb, tableName), String(item.id));
+          batch.set(docRef, sanitizeData(item), { merge: true });
         });
-      };
+        
+        await withTimeout(
+          batch.commit(),
+          8000,
+          'Mạng phản hồi chậm khi ghi lên Cloud (Gói dữ liệu đã được lưu cục bộ)'
+        );
+        trackFirestoreUsage('writes', chunk.length);
+      }
 
-      pushTable('classes', filteredClasses);
-      pushTable('students', filteredStudents);
-      pushTable('class_students', filteredClassStudents);
-      pushTable('sessions', filteredSessions);
-      pushTable('student_sessions', filteredStudentSessions);
-      pushTable('warnings', filteredWarnings);
-      pushTable('knowledge_tags', filteredKnowledgeTags);
-
-      await batch.commit();
-      localStorage.setItem('last_successful_sync_time', currentSyncStartTime);
-      setSyncStatus(`Đẩy thành công ${totalUpdatesCount} bản ghi cập nhật!`);
+      const currentSyncStartTime = new Date().toISOString();
+      localStorage.setItem(LAST_SYNC_KEY, currentSyncStartTime);
+      setSyncStatus(`Đã đồng bộ ${allOperations.length} bản ghi lên Cloud thành công!`);
+      logSyncActivity({
+        tableName: 'Tất cả các bảng',
+        action: 'push_batch',
+        description: `Đã đồng bộ thành công ${allOperations.length} bản ghi lên Cloud`,
+        status: 'success',
+      });
     } catch (error: any) {
       if (error?.code === 'resource-exhausted' || error?.message?.includes('Quota limit exceeded') || error?.message?.includes('quota')) {
         sessionStorage.setItem('firestore_quota_exceeded', 'true');
-        console.warn('[Cloud Sync] Đã đạt giới hạn ghi Firestore miễn phí trong ngày. Chuyển sang hoàn toàn Offline IndexedDB.');
-        setSyncStatus('Lỗi: Đã hết hạn ngạch ghi Firestore miễn phí trong ngày. Dữ liệu đã được lưu an toàn tại máy (Offline IndexedDB).');
+        console.warn('[Cloud Sync] Đã đạt giới hạn ghi Firestore miễn phí trong ngày.');
+        setSyncStatus('Lỗi: Đã hết hạn ngạch ghi Firestore miễn phí trong ngày.');
       } else {
         console.error('Push to cloud error:', error);
-        setSyncStatus(`Lỗi: ${error.message}`);
+        setSyncStatus(`Thông báo: ${error.message || 'Không thể kết nối đến máy chủ Cloud'}`);
       }
     } finally {
       setIsSyncing(false);
-      setTimeout(() => setSyncStatus(null), 3000);
+      setTimeout(() => setSyncStatus(null), 3500);
     }
   }, [user]);
   
@@ -139,24 +258,140 @@ export const useCloudSync = () => {
       setSyncStatus('Chế độ Offline (Đồng bộ đám mây đang tắt)');
       return;
     }
-    if (!user) {
-      setSyncStatus('Lỗi: Cần đăng nhập để đồng bộ');
+    if (isQuotaExceeded()) {
+      setSyncStatus('Chế độ Offline (Hết hạn ngạch Cloud)');
       return;
     }
     setIsSyncing(true);
     setSyncStatus('Đang tải dữ liệu từ Cloud...');
     
-    setTimeout(() => {
-      setSyncStatus('Đang đồng bộ ngầm (real-time)...');
+    try {
+      enableNetwork(firestoreDb).catch(() => {});
+
+      // 1. Fetch tombstones
+      let deletedIds = new Set<string>();
+      let deletedStudentIds = new Set<string>();
+      try {
+        const deletedSnap = await withTimeout(
+          getDocs(collection(firestoreDb, 'deleted_records')),
+          6000,
+          'Quá thời gian tải danh sách đã xóa'
+        );
+        deletedSnap.docs.forEach(docSnap => {
+          const d = docSnap.data();
+          if (d.id) deletedIds.add(String(d.id));
+          if (d.student_id) deletedStudentIds.add(String(d.student_id));
+        });
+      } catch (err) {
+        console.warn('[Pull From Cloud] Error fetching tombstones:', err);
+      }
+
+      // Purge local Dexie records matching tombstones
+      for (const delSid of deletedStudentIds) {
+        await purgeStudentCascade(delSid);
+      }
+
+      const isRecordDeleted = (id: string, studentId?: string) => {
+        return deletedIds.has(String(id)) || (studentId && deletedStudentIds.has(String(studentId)));
+      };
+
+      // 2. Fetch all collections from Firestore in parallel
+      const collectionsToSync = [
+        { name: 'classes', table: db.classes },
+        { name: 'students', table: db.students },
+        { name: 'class_students', table: db.class_students },
+        { name: 'sessions', table: db.sessions },
+        { name: 'student_sessions', table: db.student_sessions },
+        { name: 'warnings', table: db.warnings },
+        { name: 'knowledge_tags', table: db.knowledge_tags },
+        { name: 'school_years', table: db.school_years },
+        { name: 'settings', table: db.settings },
+        { name: 'knowledge_results', table: db.knowledge_results },
+        { name: 'ai_diagnoses', table: db.ai_diagnoses },
+        { name: 'audit_logs', table: db.audit_logs },
+      ];
+
+      const pullResults = await Promise.all(
+        collectionsToSync.map(async (col) => {
+          try {
+            const snap = await withTimeout(
+              getDocs(collection(firestoreDb, col.name)),
+              8000,
+              `Quá thời gian tải bảng ${col.name}`
+            );
+            trackFirestoreUsage('reads', snap.size || 1);
+            const remoteDocIds = new Set<string>();
+            const docsToPut: any[] = [];
+
+            snap.docs.forEach(docSnap => {
+              const data: any = { ...docSnap.data(), id: docSnap.id };
+              remoteDocIds.add(String(docSnap.id));
+              const studentId = data.student_id || (col.name === 'students' ? data.id : undefined);
+              if (!isRecordDeleted(data.id, studentId)) {
+                docsToPut.push(data);
+              }
+            });
+
+            return { col, remoteDocIds, docsToPut };
+          } catch (err) {
+            console.warn(`[Pull From Cloud] Error pulling ${col.name}:`, err);
+            return null;
+          }
+        })
+      );
+
+      let totalPulled = 0;
+      setRemoteSyncing(true);
+      try {
+        const lockTables = collectionsToSync.map(c => c.table);
+        await db.transaction('rw', lockTables, async () => {
+          for (const res of pullResults) {
+            if (!res) continue;
+            const { col, remoteDocIds, docsToPut } = res;
+
+            // Reconcile missing remote docs
+            const localItems = await (col.table as any).toArray();
+            for (const localItem of localItems) {
+              const localIdStr = String(localItem.id);
+              if (!remoteDocIds.has(localIdStr)) {
+                if (col.name === 'students') {
+                  await purgeStudentCascade(localItem.id);
+                } else {
+                  await (col.table as any).delete(localItem.id);
+                }
+              }
+            }
+
+            if (docsToPut.length > 0) {
+              await (col.table as any).bulkPut(docsToPut);
+              totalPulled += docsToPut.length;
+            }
+          }
+        });
+      } finally {
+        setRemoteSyncing(false);
+      }
+
+      localStorage.setItem(LAST_SYNC_KEY, new Date().toISOString());
+      const finalStudents = await db.students.toArray();
+      setSyncStatus(`Tải thành công ${totalPulled} bản ghi (Còn ${finalStudents.length} học sinh hiện tại) từ Cloud!`);
+      logSyncActivity({
+        tableName: 'Tất cả các bảng',
+        action: 'pull_batch',
+        description: `Đã tải về thành công ${totalPulled} bản ghi từ Cloud`,
+        status: 'success',
+      });
+    } catch (err: any) {
+      console.error('[Pull From Cloud] Error:', err);
+      setSyncStatus(`Lỗi tải từ Cloud: ${err.message}`);
+    } finally {
       setIsSyncing(false);
       setTimeout(() => setSyncStatus(null), 3000);
-    }, 1000);
+    }
   }, [user]);
 
-  // Real-time synchronization from Firestore to Dexie using onSnapshot
+  // Real-time synchronization from Firestore to Dexie using onSnapshot with debounced batching
   useEffect(() => {
-    if (!user) return;
-
     if (isQuotaExceeded()) {
       try {
         disableNetwork(firestoreDb).catch(() => {});
@@ -173,21 +408,80 @@ export const useCloudSync = () => {
       unsubs.length = 0;
     };
 
+    // Queue for batching real-time updates across collections into a single Dexie transaction
+    const pendingPuts = new Map<any, any[]>();
+    const pendingDeletes = new Map<any, (string | number)[]>();
+    let batchTimer: any = null;
+
+    const flushBatchedUpdates = async () => {
+      batchTimer = null;
+      if (pendingPuts.size === 0 && pendingDeletes.size === 0) return;
+
+      const tablesToLock = Array.from(
+        new Set([...pendingPuts.keys(), ...pendingDeletes.keys()])
+      );
+      if (tablesToLock.length === 0) return;
+
+      const putsToProcess = new Map(pendingPuts);
+      const deletesToProcess = new Map(pendingDeletes);
+      pendingPuts.clear();
+      pendingDeletes.clear();
+
+      setRemoteSyncing(true);
+      try {
+        await db.transaction('rw', tablesToLock, async () => {
+          for (const [table, items] of putsToProcess.entries()) {
+            if (items.length > 0) {
+              await table.bulkPut(items);
+            }
+          }
+          for (const [table, ids] of deletesToProcess.entries()) {
+            if (ids.length > 0) {
+              await table.bulkDelete(ids);
+            }
+          }
+        });
+      } catch (err) {
+        console.error('Error executing batched realtime transaction:', err);
+      } finally {
+        setRemoteSyncing(false);
+      }
+    };
+
+    const scheduleBatchFlush = () => {
+      if (!batchTimer) {
+        batchTimer = setTimeout(flushBatchedUpdates, 50);
+      }
+    };
+
     const setupListener = (tableName: string, dexieTable: any) => {
       const colRef = collection(firestoreDb, tableName);
       const unsub = onSnapshot(colRef, async (snapshot) => {
         try {
-          await db.transaction('rw', dexieTable, async () => {
-            const changes = snapshot.docChanges();
-            for (const change of changes) {
-              const data = { ...change.doc.data(), id: change.doc.id };
-              if (change.type === 'added' || change.type === 'modified') {
-                await dexieTable.put(data);
-              } else if (change.type === 'removed') {
-                await dexieTable.delete(data.id);
+          // Echo Loopback Guard: Skip changes that originated from local pending writes
+          if (snapshot.metadata.hasPendingWrites) return;
+
+          const changes = snapshot.docChanges();
+          if (changes.length === 0) return;
+
+          for (const change of changes) {
+            const data = { ...change.doc.data(), id: change.doc.id };
+            if (change.type === 'added' || change.type === 'modified') {
+              if (dexieTable) {
+                if (!pendingPuts.has(dexieTable)) pendingPuts.set(dexieTable, []);
+                pendingPuts.get(dexieTable)!.push(data);
+              }
+            } else if (change.type === 'removed') {
+              if (tableName === 'students') {
+                await purgeStudentCascade(data.id);
+              } else if (dexieTable) {
+                if (!pendingDeletes.has(dexieTable)) pendingDeletes.set(dexieTable, []);
+                pendingDeletes.get(dexieTable)!.push(data.id);
               }
             }
-          });
+          }
+
+          scheduleBatchFlush();
         } catch (err) {
           console.error(`Error syncing ${tableName} to Dexie:`, err);
         }
@@ -196,7 +490,7 @@ export const useCloudSync = () => {
           markQuotaExceeded();
           stopAllListeners();
         } else if (error?.code === 'unavailable') {
-          console.warn(`[Cloud Sync] Firestore hiện không khả dụng (offline hoặc sự cố mạng) cho bảng ${tableName}. Chạy ở chế độ Offline IndexedDB.`);
+          console.warn(`[Cloud Sync] Firestore hiện không khả dụng cho bảng ${tableName}. Chạy ở chế độ Offline IndexedDB.`);
           stopAllListeners();
         } else {
           console.error(`Error listening to ${tableName}:`, error);
@@ -205,6 +499,39 @@ export const useCloudSync = () => {
       unsubs.push(unsub);
     };
 
+    // Listen to tombstones (deleted_records)
+    const setupTombstoneListener = () => {
+      const colRef = collection(firestoreDb, 'deleted_records');
+      const unsub = onSnapshot(colRef, async (snapshot) => {
+        try {
+          const changes = snapshot.docChanges();
+          for (const change of changes) {
+            if (change.type === 'added' || change.type === 'modified') {
+              const data = change.doc.data();
+              const targetTable = data.table_name;
+              const targetId = data.id;
+              const studentId = data.student_id;
+
+              if (studentId) {
+                await purgeStudentCascade(studentId);
+              }
+              if (targetTable && targetId && (db as any)[targetTable]) {
+                try {
+                  await (db as any)[targetTable].delete(targetId);
+                } catch (_) {}
+              }
+            }
+          }
+        } catch (err) {
+          console.error('Error listening to deleted_records tombstones:', err);
+        }
+      }, (err) => {
+        console.warn('deleted_records listener error:', err);
+      });
+      unsubs.push(unsub);
+    };
+
+    setupTombstoneListener();
     setupListener('classes', db.classes);
     setupListener('students', db.students);
     setupListener('class_students', db.class_students);
@@ -212,35 +539,38 @@ export const useCloudSync = () => {
     setupListener('student_sessions', db.student_sessions);
     setupListener('warnings', db.warnings);
     setupListener('knowledge_tags', db.knowledge_tags);
+    setupListener('school_years', db.school_years);
+    setupListener('settings', db.settings);
+    setupListener('knowledge_results', db.knowledge_results);
+    setupListener('ai_diagnoses', db.ai_diagnoses);
+    setupListener('audit_logs', db.audit_logs);
+
+    // Auto-reconnect listener: automatically run delta sync when internet returns
+    const handleOnline = () => {
+      if (pushToCloudRef.current && !isQuotaExceeded()) {
+        pushToCloudRef.current(false).catch(() => {});
+      }
+    };
+    window.addEventListener('online', handleOnline);
 
     return () => {
       stopAllListeners();
+      if (batchTimer) clearTimeout(batchTimer);
+      window.removeEventListener('online', handleOnline);
     };
-  }, [user]);
+  }, []);
 
-  // Tự động đẩy dữ liệu khi thoát hoặc ẩn ứng dụng (chỉ khi chưa vượt quá quota)
+  // Tự động bảo vệ dữ liệu khi người dùng đóng tab hoặc thoát trình duyệt
   useEffect(() => {
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'hidden' && pushToCloudRef.current) {
-        if (!isQuotaExceeded()) {
-          pushToCloudRef.current().catch(() => {});
-        }
-      }
-    };
-    
     const handleBeforeUnload = () => {
-      if (pushToCloudRef.current) {
-        if (!isQuotaExceeded()) {
-          pushToCloudRef.current().catch(() => {});
-        }
+      if (pushToCloudRef.current && !isQuotaExceeded()) {
+        pushToCloudRef.current(false).catch(() => {});
       }
     };
 
-    document.addEventListener('visibilitychange', handleVisibilityChange);
     window.addEventListener('beforeunload', handleBeforeUnload);
 
     return () => {
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('beforeunload', handleBeforeUnload);
     };
   }, []);
@@ -252,3 +582,5 @@ export const useCloudSync = () => {
     pullFromCloud
   };
 };
+
+

@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
-import { onAuthStateChanged, User } from 'firebase/auth';
+import { onAuthStateChanged, User, signInAnonymously } from 'firebase/auth';
 import { auth, signInWithGoogle, logOut } from './firebase';
 
 interface AuthContextType {
@@ -23,9 +23,21 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-      setUser(currentUser);
-      setLoading(false);
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      if (!currentUser) {
+        try {
+          const anonUser = await signInAnonymously(auth);
+          setUser(anonUser.user);
+        } catch (err) {
+          console.warn('[AuthContext] Anonymous auto-signin skipped or failed:', err);
+          setUser(null);
+        } finally {
+          setLoading(false);
+        }
+      } else {
+        setUser(currentUser);
+        setLoading(false);
+      }
     });
     return () => unsubscribe();
   }, []);

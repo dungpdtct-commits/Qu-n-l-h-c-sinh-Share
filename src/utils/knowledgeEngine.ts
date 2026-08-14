@@ -1,7 +1,7 @@
 import { db } from '../db/dexie';
-import { doc } from 'firebase/firestore';
+import { doc, writeBatch } from 'firebase/firestore';
 import { db as firestoreDb } from '../lib/firebase';
-import { safeSetDoc } from '../lib/firestoreUtils';
+import { safeSetDoc, safeBatchCommit } from '../lib/firestoreUtils';
 import { StudentSession, Session } from '../types';
 
 /**
@@ -21,11 +21,12 @@ export async function recalculateKnowledgeMastery(
   const tag = await db.knowledge_tags.get(targetTagId);
   const allSessions = await db.sessions.toArray();
 
-  // Tìm tất cả các buổi học thuộc chuyên đề này (bằng ID hoặc theo tên bài học)
+  // Tìm tất cả các buổi học thuộc chuyên đề này (bằng ID, tên bài học hoặc chủ đề bài kiểm tra)
   const matchedSessions = allSessions.filter(
     (s) =>
       String(s.knowledge_tag_id) === targetTagId ||
-      (tag && s.lesson_title && s.lesson_title.toLowerCase().includes(tag.tag_name.toLowerCase()))
+      (tag && s.lesson_title && s.lesson_title.toLowerCase().includes(tag.tag_name.toLowerCase())) ||
+      (tag && s.test_knowledge_tag && s.test_knowledge_tag !== 'same' && s.test_knowledge_tag.toLowerCase().includes(tag.tag_name.toLowerCase()))
   );
 
   if (matchedSessions.length === 0) return null;
@@ -149,6 +150,15 @@ export async function recalculateKnowledgeResultsForClass(classId: string | numb
 
     // Tìm tag_id phù hợp từ session
     let tagId = sess.knowledge_tag_id ? String(sess.knowledge_tag_id) : undefined;
+    if (!tagId && sess.test_knowledge_tag && sess.test_knowledge_tag !== 'same') {
+      const matched = allTags.find((t) =>
+        sess.test_knowledge_tag!.toLowerCase().includes(t.tag_name.toLowerCase()) ||
+        t.tag_name.toLowerCase().includes(sess.test_knowledge_tag!.toLowerCase())
+      );
+      if (matched && matched.id) {
+        tagId = String(matched.id);
+      }
+    }
     if (!tagId && sess.lesson_title) {
       const matched = allTags.find((t) =>
         sess.lesson_title.toLowerCase().includes(t.tag_name.toLowerCase())
@@ -188,20 +198,21 @@ export async function recalculateKnowledgeResultsForClass(classId: string | numb
   });
 
   const now = new Date().toISOString();
-  let updatedCount = 0;
+  
+  // Pre-fetch all existing knowledge_results in 1 query
+  const existingResults = await db.knowledge_results.toArray();
+  const existingMap = new Map(existingResults.map((kr) => [`${kr.student_id}_${kr.knowledge_tag_id}`, kr.id]));
 
-  // Lưu/Cập nhật bản ghi KnowledgeResult cho từng (student_id, knowledge_tag_id)
+  const dexiePayloads: any[] = [];
+  const firestorePayloads: any[] = [];
+
   for (const [studentId, tagsMap] of Object.entries(studentTagScores)) {
     for (const [tagId, scores] of Object.entries(tagsMap)) {
       if (scores.length === 0) continue;
       const avgScore = Number((scores.reduce((a, b) => a + b, 0) / scores.length).toFixed(1));
 
-      // Kiểm tra xem đã có bản ghi trong db chưa
-      const existing = await db.knowledge_results
-        .where({ student_id: studentId, knowledge_tag_id: tagId })
-        .first();
-
-      const recordId = existing?.id || `kr_${studentId}_${tagId}`;
+      const existingId = existingMap.get(`${studentId}_${tagId}`);
+      const recordId = existingId || `kr_${studentId}_${tagId}`;
       const payload = {
         id: recordId,
         student_id: studentId,
@@ -210,16 +221,23 @@ export async function recalculateKnowledgeResultsForClass(classId: string | numb
         last_updated: now,
       };
 
-      await db.knowledge_results.put(payload);
-
-      if (firestoreDb) {
-        await safeSetDoc(doc(firestoreDb, 'knowledge_results', String(recordId)), payload, { merge: true });
-      }
-
-      updatedCount++;
+      dexiePayloads.push(payload);
+      firestorePayloads.push(payload);
     }
   }
 
-  return updatedCount;
+  if (dexiePayloads.length > 0) {
+    await db.knowledge_results.bulkPut(dexiePayloads);
+  }
+
+  if (firestoreDb && firestorePayloads.length > 0) {
+    const batch = writeBatch(firestoreDb);
+    firestorePayloads.forEach((p) => {
+      batch.set(doc(firestoreDb, 'knowledge_results', String(p.id)), p, { merge: true });
+    });
+    await safeBatchCommit(batch);
+  }
+
+  return dexiePayloads.length;
 }
 

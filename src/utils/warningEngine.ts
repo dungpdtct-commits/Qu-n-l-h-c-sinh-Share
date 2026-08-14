@@ -1,7 +1,7 @@
 import { db } from '../db/dexie';
-import { doc } from 'firebase/firestore';
+import { doc, writeBatch } from 'firebase/firestore';
 import { db as firestoreDb } from '../lib/firebase';
-import { safeSetDoc } from '../lib/firestoreUtils';
+import { safeSetDoc, safeBatchCommit } from '../lib/firestoreUtils';
 import { logAudit } from './auditLogger';
 import {
   Student,
@@ -576,52 +576,70 @@ export async function runWarningScanForClass(
     }
   }
 
+  // Pre-fetch all student sessions for this class's sessions in 1 query
+  const sessionIds = classSessions.map(s => s.id!).filter(Boolean);
+  const allClassStudentSessions = await db.student_sessions
+    .where('session_id')
+    .anyOf(sessionIds)
+    .toArray();
+  const studentSessionsMap = new Map<string, StudentSession[]>();
+  allClassStudentSessions.forEach(ss => {
+    const sKey = String(ss.student_id);
+    if (!studentSessionsMap.has(sKey)) studentSessionsMap.set(sKey, []);
+    studentSessionsMap.get(sKey)!.push(ss);
+  });
+
+  // Pre-fetch all students in 1 query
+  const allStudents = await db.students.where('id').anyOf(studentIds).toArray();
+  const studentMap = new Map(allStudents.map(s => [String(s.id), s]));
+
+  // Pre-fetch all warnings for these students
+  const allStudentWarnings = await db.warnings.where('student_id').anyOf(studentIds).toArray();
+  const warningsByStudent = new Map<string, any[]>();
+  allStudentWarnings.forEach(w => {
+    const sKey = String(w.student_id);
+    if (!warningsByStudent.has(sKey)) warningsByStudent.set(sKey, []);
+    warningsByStudent.get(sKey)!.push(w);
+  });
+
+  const warningsToPut: any[] = [];
+  const firestoreWarningsToSet: any[] = [];
+
   for (const studentId of studentIds) {
-    const student = await db.students.get(studentId);
+    const student = studentMap.get(String(studentId));
     if (!student) continue;
+
+    const studentIdStr = String(studentId);
+    const existingWarnings = warningsByStudent.get(studentIdStr) || [];
 
     // Auto cancel/resolve active warnings if student status is 'paused' or 'stopped'
     if (student.status !== 'studying') {
-      const activeWarnings = await db.warnings
-        .where({ student_id: studentId, resolved: 0 })
-        .toArray();
+      const activeWarnings = existingWarnings.filter(w => !w.resolved);
 
       for (const w of activeWarnings) {
         const resolveAction = `Tự động hủy cảnh báo do học sinh chuyển trạng thái: ${
           student.status === 'paused' ? 'Tạm nghỉ' : 'Nghỉ hẳn'
         }`;
-        await db.warnings.update(w.id!, {
+        const updatedW = {
+          ...w,
           resolved: true,
           resolved_action: resolveAction,
           updated_at: now,
-        });
-
-        if (firestoreDb && w.id) {
-          await safeSetDoc(doc(firestoreDb, 'warnings', String(w.id)), {
-            ...w,
-            resolved: true,
-            resolved_action: resolveAction,
-            updated_at: now,
-            id: w.id
-          }, { merge: true });
-        }
+        };
+        warningsToPut.push(updatedW);
+        firestoreWarningsToSet.push(updatedW);
       }
       continue;
     }
 
     // Get student sessions
-    const studentSessions = await db.student_sessions
-      .where('student_id')
-      .equals(studentId)
-      .toArray();
+    const studentSessions = studentSessionsMap.get(studentIdStr) || [];
 
     const stats = calculateStudentStats(studentId, classSessions, studentSessions, config);
     const detectedList = detectStudentWarnings(student, stats, classSessions, studentSessions, config);
 
     // Fetch all currently active (unresolved) warnings for this student
-    const activeWarnings = (
-      await db.warnings.where('student_id').equals(studentId).toArray()
-    ).filter((w) => !w.resolved);
+    const activeWarnings = existingWarnings.filter((w) => !w.resolved);
 
     // 1. Tự động đánh giá và HỦY/HOÀN THÀNH các cảnh báo cũ nếu không còn vi phạm tiêu chí (do sửa điểm/làm bài bù)
     const detectedTitles = new Set(detectedList.map((d) => d.title));
@@ -633,25 +651,14 @@ export async function runWarningScanForClass(
 
       if (!stillTriggers) {
         const resolveAction = 'Tự động hoàn thành/hủy do điểm số hoặc BTVN đã được cập nhật đạt yêu cầu';
-        await db.warnings.update(activeWarn.id!, {
+        const updatedW = {
+          ...activeWarn,
           resolved: true,
           resolved_action: resolveAction,
           updated_at: now,
-        });
-
-        if (firestoreDb && activeWarn.id) {
-          await safeSetDoc(
-            doc(firestoreDb, 'warnings', String(activeWarn.id)),
-            {
-              ...activeWarn,
-              resolved: true,
-              resolved_action: resolveAction,
-              updated_at: now,
-              id: activeWarn.id,
-            },
-            { merge: true }
-          );
-        }
+        };
+        warningsToPut.push(updatedW);
+        firestoreWarningsToSet.push(updatedW);
       }
     }
 
@@ -667,7 +674,9 @@ export async function runWarningScanForClass(
       );
 
       if (!existing) {
+        const newWarnId = `warn_${studentId}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
         const warnPayload = {
+          id: newWarnId,
           student_id: studentId,
           class_id: classId,
           priority: det.priority,
@@ -678,20 +687,26 @@ export async function runWarningScanForClass(
           created_at: now,
           updated_at: now,
         };
-        const newWarnId = await db.warnings.add(warnPayload);
 
-        activeWarnings.push({ ...warnPayload, id: newWarnId });
-
-        if (firestoreDb) {
-          await safeSetDoc(doc(firestoreDb, 'warnings', String(newWarnId)), {
-            ...warnPayload,
-            id: newWarnId
-          });
-        }
+        activeWarnings.push(warnPayload);
+        warningsToPut.push(warnPayload);
+        firestoreWarningsToSet.push(warnPayload);
 
         newWarningsCount++;
       }
     }
+  }
+
+  if (warningsToPut.length > 0) {
+    await db.warnings.bulkPut(warningsToPut);
+  }
+
+  if (firestoreDb && firestoreWarningsToSet.length > 0) {
+    const batch = writeBatch(firestoreDb);
+    firestoreWarningsToSet.forEach(w => {
+      batch.set(doc(firestoreDb, 'warnings', String(w.id)), w, { merge: true });
+    });
+    await safeBatchCommit(batch);
   }
 
   if (newWarningsCount > 0) {
