@@ -3,7 +3,31 @@ import { getAuth, GoogleAuthProvider, signInWithPopup, signOut } from 'firebase/
 import { getFirestore, disableNetwork } from 'firebase/firestore';
 import firebaseConfigData from '../../firebase-applet-config.json';
 
-let activeConfig: any = firebaseConfigData;
+// Build active config: Start with bundled config, override with Vite env variables if provided
+let activeConfig: any = { ...firebaseConfigData };
+const metaEnv = (import.meta as any).env || {};
+
+if (metaEnv.VITE_FIREBASE_API_KEY) {
+  activeConfig.apiKey = metaEnv.VITE_FIREBASE_API_KEY;
+}
+if (metaEnv.VITE_FIREBASE_AUTH_DOMAIN) {
+  activeConfig.authDomain = metaEnv.VITE_FIREBASE_AUTH_DOMAIN;
+}
+if (metaEnv.VITE_FIREBASE_PROJECT_ID) {
+  activeConfig.projectId = metaEnv.VITE_FIREBASE_PROJECT_ID;
+}
+if (metaEnv.VITE_FIREBASE_STORAGE_BUCKET) {
+  activeConfig.storageBucket = metaEnv.VITE_FIREBASE_STORAGE_BUCKET;
+}
+if (metaEnv.VITE_FIREBASE_MESSAGING_SENDER_ID) {
+  activeConfig.messagingSenderId = metaEnv.VITE_FIREBASE_MESSAGING_SENDER_ID;
+}
+if (metaEnv.VITE_FIREBASE_APP_ID) {
+  activeConfig.appId = metaEnv.VITE_FIREBASE_APP_ID;
+}
+if (metaEnv.VITE_FIREBASE_DATABASE_ID) {
+  activeConfig.firestoreDatabaseId = metaEnv.VITE_FIREBASE_DATABASE_ID;
+}
 
 try {
   const useCustom = localStorage.getItem('use_custom_firebase') === 'true';
@@ -11,7 +35,7 @@ try {
   if (useCustom && customStr) {
     const parsed = JSON.parse(customStr);
     if (parsed && parsed.apiKey && parsed.projectId) {
-      activeConfig = { ...firebaseConfigData, ...parsed };
+      activeConfig = { ...activeConfig, ...parsed };
       console.log('[Firebase Init] Kích hoạt Firebase Đám Mây Cá Nhân thành công:', parsed.projectId);
     }
   }
@@ -21,7 +45,15 @@ try {
 
 const app = !getApps().length ? initializeApp(activeConfig) : getApp();
 const auth = getAuth(app);
-const db = getFirestore(app, activeConfig.firestoreDatabaseId || (firebaseConfigData as any).firestoreDatabaseId);
+
+// Determine database ID:
+// If custom database is defined, use it.
+// If project matches AI Studio provisioned project, use the provisioned database ID.
+// Otherwise (e.g. personal Firebase project with standard default database), use default database.
+const isAiStudioProject = activeConfig.projectId === 'gen-lang-client-0542163673' || activeConfig.projectId === (firebaseConfigData as any).projectId;
+const resolvedDatabaseId = activeConfig.firestoreDatabaseId || (isAiStudioProject ? (firebaseConfigData as any).firestoreDatabaseId : undefined);
+
+const db = resolvedDatabaseId ? getFirestore(app, resolvedDatabaseId) : getFirestore(app);
 
 // Auto disable network if quota exceeded or cloud sync is disabled
 try {
