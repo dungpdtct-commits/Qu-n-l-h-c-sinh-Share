@@ -14,11 +14,11 @@ import {
   Legend,
 } from 'recharts';
 import { ClassItem, Session, Student, StudentSession, AttendanceStatus, KnowledgeTag } from '../types';
-import { db, recordDeletionTombstone } from '../db/dexie';
+import { db, recordDeletionTombstone, setRemoteSyncing } from '../db/dexie';
 import { sortStudentsByName } from '../utils/sortUtils';
 import { doc, writeBatch } from 'firebase/firestore';
 import { db as firestoreDb } from '../lib/firebase';
-import { safeSetDoc, safeDeleteDoc, safeBatchCommit } from '../lib/firestoreUtils';
+import { safeSetDoc, safeDeleteDoc, safeBatchCommit, sanitizeForFirestore } from '../lib/firestoreUtils';
 import { logAudit } from '../utils/auditLogger';
 import { exportSessionReportPDF } from '../utils/pdfGenerator';
 import { recalculateKnowledgeResultsForClass } from '../utils/knowledgeEngine';
@@ -1156,19 +1156,29 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
         }
       }
 
-      // 1. Bulk update IndexedDB in 1 atomic transaction
-      if (docsToBulkPut.length > 0) {
-        await db.student_sessions.bulkPut(docsToBulkPut);
+      // 1. Bulk update IndexedDB in 1 atomic transaction (pause hooks to prevent redundant single-doc pushes)
+      setRemoteSyncing(true);
+      try {
+        if (docsToBulkPut.length > 0) {
+          await db.student_sessions.bulkPut(docsToBulkPut);
+        }
+      } finally {
+        setRemoteSyncing(false);
       }
 
       // 2. Batch write to Firestore in 1 writeBatch HTTP/gRPC call
       if (firestoreDb && firestorePayloads.length > 0) {
-        const batch = writeBatch(firestoreDb);
-        firestorePayloads.forEach((payload) => {
-          const docRef = doc(firestoreDb, 'student_sessions', String(payload.id));
-          batch.set(docRef, payload, { merge: true });
-        });
-        await safeBatchCommit(batch);
+        try {
+          const batch = writeBatch(firestoreDb);
+          firestorePayloads.forEach((payload) => {
+            const docRef = doc(firestoreDb, 'student_sessions', String(payload.id));
+            const cleanPayload = sanitizeForFirestore(payload);
+            batch.set(docRef, cleanPayload, { merge: true });
+          });
+          await safeBatchCommit(batch, firestorePayloads.length);
+        } catch (fErr) {
+          console.warn('[Firestore Batch Write Warning]', fErr);
+        }
       }
 
       setStudentSessions(updatedSessions);
@@ -1817,20 +1827,26 @@ export const UltraFastGradeEntry: React.FC<UltraFastGradeEntryProps> = ({
                 <div className="text-xs font-bold mt-1 flex items-center gap-1.5">
                   {syncStatus === 'saving' ? (
                     <span className="text-amber-600 dark:text-amber-400 flex items-center gap-1">
-                      <RefreshCw className="w-3.5 h-3.5 animate-spin" /> Đang lưu...
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" /> Đang đồng bộ Cloud...
                     </span>
                   ) : syncStatus === 'synced' ? (
                     <span className="text-emerald-600 dark:text-emerald-400 flex items-center gap-1">
-                      <CheckCircle2 className="w-3.5 h-3.5" /> Đồng bộ Dexie & Firestore {lastSyncedTime && `(${lastSyncedTime})`}
+                      <CheckCircle2 className="w-3.5 h-3.5" /> Đồng bộ Realtime Firestore {lastSyncedTime && `(${lastSyncedTime})`}
                     </span>
                   ) : (
                     <span className="text-slate-500 flex items-center gap-1">
-                      <Clock className="w-3.5 h-3.5" /> Lưu Local (Offline)
+                      <Clock className="w-3.5 h-3.5" /> Lưu Cục bộ (Offline)
                     </span>
                   )}
                 </div>
               </div>
-              <div className="p-2 bg-amber-50 dark:bg-amber-950/60 rounded-xl text-amber-600 dark:text-amber-400">
+              <div className={`p-2 rounded-xl ${
+                syncStatus === 'synced'
+                  ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-400'
+                  : syncStatus === 'saving'
+                  ? 'bg-amber-50 dark:bg-amber-950/60 text-amber-600 dark:text-amber-400'
+                  : 'bg-slate-100 dark:bg-slate-800 text-slate-500'
+              }`}>
                 <Zap className="w-5 h-5" />
               </div>
             </div>

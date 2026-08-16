@@ -105,9 +105,7 @@ export const isCloudSyncEnabled = (): boolean => {
 
 export const isQuotaExceeded = (): boolean => {
   if (!isCloudSyncEnabled()) return true; // Treat as exceeded to run strictly offline
-  const today = new Date().toDateString();
-  const savedQuotaDate = localStorage.getItem('firestore_quota_exceeded_date');
-  return savedQuotaDate === today || sessionStorage.getItem('firestore_quota_exceeded') === 'true';
+  return sessionStorage.getItem('firestore_quota_exceeded') === 'true';
 };
 
 export const resetQuotaLock = async (): Promise<boolean> => {
@@ -155,13 +153,35 @@ export const isQuotaError = (error: any): boolean => {
   );
 };
 
+export const sanitizeForFirestore = (obj: any): any => {
+  if (obj === null || obj === undefined) return null;
+  if (typeof obj !== 'object') return obj;
+  if (obj instanceof Date) return obj.toISOString();
+  if (Array.isArray(obj)) {
+    return obj.map(sanitizeForFirestore).filter((v) => v !== undefined);
+  }
+
+  const clean: Record<string, any> = {};
+  for (const [key, val] of Object.entries(obj)) {
+    if (val !== undefined) {
+      if (typeof val === 'object' && val !== null && !(val instanceof Date)) {
+        clean[key] = sanitizeForFirestore(val);
+      } else {
+        clean[key] = val;
+      }
+    }
+  }
+  return clean;
+};
+
 export const safeSetDoc = async (docRef: any, data: any, options?: any): Promise<boolean> => {
   if (!isCloudSyncEnabled() || isQuotaExceeded()) return false;
   try {
+    const cleanData = sanitizeForFirestore(data);
     if (options) {
-      await setDoc(docRef, data, options);
+      await setDoc(docRef, cleanData, options);
     } else {
-      await setDoc(docRef, data);
+      await setDoc(docRef, cleanData);
     }
     trackFirestoreUsage('writes', 1);
     return true;
@@ -194,7 +214,8 @@ export const safeDeleteDoc = async (docRef: any): Promise<boolean> => {
 export const safeAddDoc = async (collectionRef: any, data: any): Promise<any> => {
   if (!isCloudSyncEnabled() || isQuotaExceeded()) return null;
   try {
-    const docRef = await addDoc(collectionRef, data);
+    const cleanData = sanitizeForFirestore(data);
+    const docRef = await addDoc(collectionRef, cleanData);
     trackFirestoreUsage('writes', 1);
     return docRef;
   } catch (error: any) {

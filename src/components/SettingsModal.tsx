@@ -64,9 +64,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     localStorage.getItem('cloud_sync_enabled') !== 'false'
   );
   const [quotaExceeded, setQuotaExceeded] = useState(() => {
-    const today = new Date().toDateString();
-    return localStorage.getItem('firestore_quota_exceeded_date') === today || 
-           sessionStorage.getItem('firestore_quota_exceeded') === 'true';
+    return sessionStorage.getItem('firestore_quota_exceeded') === 'true';
   });
   const [isWipingCloud, setIsWipingCloud] = useState(false);
   const [wipeCloudStatus, setWipeCloudStatus] = useState<string | null>(null);

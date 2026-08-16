@@ -31,6 +31,7 @@ export async function pushSingleDocToFirestore(tableName: string, docId: string 
     const dId = String(docId);
     const docRef = doc(firestoreDb, tableName, dId);
     if (isDelete) {
+      await recordDeletionTombstone(dId, tableName);
       await safeDeleteDoc(docRef);
       logSyncActivity({
         tableName,

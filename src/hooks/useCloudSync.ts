@@ -40,6 +40,8 @@ export const purgeStudentCascade = async (studentId: string | number) => {
   const sidNum = Number(studentId);
   const isNum = !isNaN(sidNum);
 
+  console.log(`[purgeStudentCascade] Initiating cascading delete for student #${studentId}`);
+  setRemoteSyncing(true);
   try {
     await db.transaction('rw', [db.students, db.class_students, db.student_sessions, db.warnings, db.knowledge_results, db.ai_diagnoses], async () => {
       await db.students.delete(sidStr);
@@ -56,8 +58,11 @@ export const purgeStudentCascade = async (studentId: string | number) => {
       await delByField(db.knowledge_results);
       await delByField(db.ai_diagnoses);
     });
+    console.log(`[purgeStudentCascade] Successfully purged student #${studentId} and related records locally`);
   } catch (err) {
     console.warn(`[purgeStudentCascade] Error deleting student ${studentId}:`, err);
+  } finally {
+    setRemoteSyncing(false);
   }
 };
 
@@ -392,12 +397,22 @@ export const useCloudSync = () => {
 
   // Real-time synchronization from Firestore to Dexie using onSnapshot with debounced batching
   useEffect(() => {
+    // Clear legacy/stale quota lock from localStorage if sessionStorage is not explicitly locked
+    if (sessionStorage.getItem('firestore_quota_exceeded') !== 'true') {
+      localStorage.removeItem('firestore_quota_exceeded_date');
+    }
+
     if (isQuotaExceeded()) {
       try {
         disableNetwork(firestoreDb).catch(() => {});
       } catch (_) {}
       return;
     }
+
+    // Ensure network is enabled for real-time listeners
+    try {
+      enableNetwork(firestoreDb).catch(() => {});
+    } catch (_) {}
 
     const unsubs: (() => void)[] = [];
 
@@ -417,11 +432,6 @@ export const useCloudSync = () => {
       batchTimer = null;
       if (pendingPuts.size === 0 && pendingDeletes.size === 0) return;
 
-      const tablesToLock = Array.from(
-        new Set([...pendingPuts.keys(), ...pendingDeletes.keys()])
-      );
-      if (tablesToLock.length === 0) return;
-
       const putsToProcess = new Map(pendingPuts);
       const deletesToProcess = new Map(pendingDeletes);
       pendingPuts.clear();
@@ -429,20 +439,23 @@ export const useCloudSync = () => {
 
       setRemoteSyncing(true);
       try {
-        await db.transaction('rw', tablesToLock, async () => {
-          for (const [table, items] of putsToProcess.entries()) {
-            if (items.length > 0) {
-              await table.bulkPut(items);
-            }
+        for (const [table, items] of putsToProcess.entries()) {
+          if (items.length > 0 && table) {
+            console.log(`[Firestore Listener: Flush] Bulk putting ${items.length} item(s) into Dexie table.`);
+            await table.bulkPut(items);
           }
-          for (const [table, ids] of deletesToProcess.entries()) {
-            if (ids.length > 0) {
-              await table.bulkDelete(ids);
-            }
+        }
+        for (const [table, ids] of deletesToProcess.entries()) {
+          if (ids.length > 0 && table) {
+            const strIds = ids.map((id) => String(id));
+            const numIds = ids.map((id) => Number(id)).filter((id) => !isNaN(id));
+            const allIds = Array.from(new Set([...strIds, ...numIds]));
+            console.log(`[Firestore Listener: Flush] Bulk deleting ${allIds.length} ID(s) from Dexie table.`);
+            await table.bulkDelete(allIds);
           }
-        });
+        }
       } catch (err) {
-        console.error('Error executing batched realtime transaction:', err);
+        console.error('[Firestore Listener: Flush] Error executing batched realtime puts/deletes:', err);
       } finally {
         setRemoteSyncing(false);
       }
@@ -450,7 +463,7 @@ export const useCloudSync = () => {
 
     const scheduleBatchFlush = () => {
       if (!batchTimer) {
-        batchTimer = setTimeout(flushBatchedUpdates, 50);
+        batchTimer = setTimeout(flushBatchedUpdates, 0);
       }
     };
 
@@ -458,14 +471,26 @@ export const useCloudSync = () => {
       const colRef = collection(firestoreDb, tableName);
       const unsub = onSnapshot(colRef, async (snapshot) => {
         try {
-          // Echo Loopback Guard: Skip changes that originated from local pending writes
-          if (snapshot.metadata.hasPendingWrites) return;
-
           const changes = snapshot.docChanges();
+          console.log(
+            `[Firestore Listener: ${tableName}] Snapshot event received. Total docs: ${snapshot.size}, changes: ${changes.length}, hasPendingWrites: ${snapshot.metadata.hasPendingWrites}, fromCache: ${snapshot.metadata.fromCache}`
+          );
+
+          // Echo Loopback Guard: Skip changes that originated from local pending writes
+          if (snapshot.metadata.hasPendingWrites) {
+            console.log(`[Firestore Listener: ${tableName}] Ignored snapshot due to local pending writes (hasPendingWrites=true)`);
+            return;
+          }
+
           if (changes.length === 0) return;
 
           for (const change of changes) {
-            const data = { ...change.doc.data(), id: change.doc.id };
+            const docId = change.doc.id;
+            const rawData = change.doc.data();
+            const data = { ...rawData, id: docId };
+
+            console.log(`[Firestore Listener: ${tableName}] Change event [type=${change.type}] for doc #${docId}`, change.type !== 'removed' ? data : '');
+
             if (change.type === 'added' || change.type === 'modified') {
               if (dexieTable) {
                 if (!pendingPuts.has(dexieTable)) pendingPuts.set(dexieTable, []);
@@ -473,27 +498,29 @@ export const useCloudSync = () => {
               }
             } else if (change.type === 'removed') {
               if (tableName === 'students') {
-                await purgeStudentCascade(data.id);
+                console.log(`[Firestore Listener: ${tableName}] Processing removal for student #${docId}`);
+                await purgeStudentCascade(docId);
               } else if (dexieTable) {
+                console.log(`[Firestore Listener: ${tableName}] Queuing deletion for doc #${docId}`);
                 if (!pendingDeletes.has(dexieTable)) pendingDeletes.set(dexieTable, []);
-                pendingDeletes.get(dexieTable)!.push(data.id);
+                pendingDeletes.get(dexieTable)!.push(docId);
               }
             }
           }
 
           scheduleBatchFlush();
         } catch (err) {
-          console.error(`Error syncing ${tableName} to Dexie:`, err);
+          console.error(`[Firestore Listener: ${tableName}] Error processing snapshot:`, err);
         }
       }, (error) => {
         if (isQuotaError(error) || error?.code === 'resource-exhausted') {
+          console.warn(`[Firestore Listener: ${tableName}] Quota limit reached.`);
           markQuotaExceeded();
           stopAllListeners();
         } else if (error?.code === 'unavailable') {
-          console.warn(`[Cloud Sync] Firestore hiện không khả dụng cho bảng ${tableName}. Chạy ở chế độ Offline IndexedDB.`);
-          stopAllListeners();
+          console.warn(`[Firestore Listener: ${tableName}] Firestore connection temporarily unavailable. Auto-reconnecting...`);
         } else {
-          console.error(`Error listening to ${tableName}:`, error);
+          console.error(`[Firestore Listener: ${tableName}] Listener error:`, error);
         }
       });
       unsubs.push(unsub);
@@ -504,29 +531,52 @@ export const useCloudSync = () => {
       const colRef = collection(firestoreDb, 'deleted_records');
       const unsub = onSnapshot(colRef, async (snapshot) => {
         try {
-          const changes = snapshot.docChanges();
-          for (const change of changes) {
-            if (change.type === 'added' || change.type === 'modified') {
-              const data = change.doc.data();
-              const targetTable = data.table_name;
-              const targetId = data.id;
-              const studentId = data.student_id;
+          if (snapshot.metadata.hasPendingWrites) {
+            console.log('[Firestore Listener: Tombstones] Ignoring local pending write snapshot.');
+            return;
+          }
 
-              if (studentId) {
-                await purgeStudentCascade(studentId);
-              }
-              if (targetTable && targetId && (db as any)[targetTable]) {
-                try {
-                  await (db as any)[targetTable].delete(targetId);
-                } catch (_) {}
+          const changes = snapshot.docChanges();
+          if (changes.length > 0) {
+            console.log(`[Firestore Listener: Tombstones] Snapshot received with ${changes.length} change(s).`);
+          }
+
+          setRemoteSyncing(true);
+          try {
+            for (const change of changes) {
+              if (change.type === 'added' || change.type === 'modified') {
+                const data = change.doc.data();
+                const targetTable = data.table_name;
+                const targetId = data.id;
+                const studentId = data.student_id;
+
+                console.log(`[Firestore Listener: Tombstones] Received tombstone [type=${change.type}] for table=${targetTable}, id=${targetId}, student_id=${studentId}`);
+
+                if (studentId) {
+                  await purgeStudentCascade(studentId);
+                }
+                if (targetTable && targetId && (db as any)[targetTable]) {
+                  try {
+                    const targetTableObj = (db as any)[targetTable];
+                    console.log(`[Firestore Listener: Tombstones] Deleting record #${targetId} from table ${targetTable}`);
+                    await targetTableObj.delete(String(targetId));
+                    if (!isNaN(Number(targetId))) {
+                      await targetTableObj.delete(Number(targetId));
+                    }
+                  } catch (delErr) {
+                    console.warn(`[Firestore Listener: Tombstones] Error deleting #${targetId} from ${targetTable}:`, delErr);
+                  }
+                }
               }
             }
+          } finally {
+            setRemoteSyncing(false);
           }
         } catch (err) {
-          console.error('Error listening to deleted_records tombstones:', err);
+          console.error('[Firestore Listener: Tombstones] Error processing snapshot:', err);
         }
       }, (err) => {
-        console.warn('deleted_records listener error:', err);
+        console.warn('[Firestore Listener: Tombstones] Listener error:', err);
       });
       unsubs.push(unsub);
     };
@@ -544,6 +594,9 @@ export const useCloudSync = () => {
     setupListener('knowledge_results', db.knowledge_results);
     setupListener('ai_diagnoses', db.ai_diagnoses);
     setupListener('audit_logs', db.audit_logs);
+
+    // Initial background sync on app start to pull any missed offline updates automatically
+    pullFromCloud().catch(() => {});
 
     // Auto-reconnect listener: automatically run delta sync when internet returns
     const handleOnline = () => {

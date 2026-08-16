@@ -55,22 +55,20 @@ const resolvedDatabaseId = activeConfig.firestoreDatabaseId || (isAiStudioProjec
 
 const db = resolvedDatabaseId ? getFirestore(app, resolvedDatabaseId) : getFirestore(app);
 
-// Auto disable network if quota exceeded or cloud sync is disabled
+// Auto disable network ONLY if cloud sync is explicitly disabled or active session quota is exceeded
 try {
   const isSyncDisabled = localStorage.getItem('cloud_sync_enabled') === 'false';
-  const today = new Date().toDateString();
-  const savedQuotaDate = localStorage.getItem('firestore_quota_exceeded_date');
-  const isQuotaExceeded = savedQuotaDate === today || sessionStorage.getItem('firestore_quota_exceeded') === 'true';
+  const isQuotaExceeded = sessionStorage.getItem('firestore_quota_exceeded') === 'true';
   
   if (isSyncDisabled || isQuotaExceeded) {
     disableNetwork(db).then(() => {
-      console.log('[Firestore Init] Đã chủ động ngắt kết nối mạng Firestore để chạy chế độ Offline-First mượt mà (Tránh lỗi Quota / Sync đang tắt).');
+      console.log('[Firestore Init] Đã ngắt kết nối mạng Firestore do cấu hình offline hoặc đạt hạn ngạch.');
     }).catch(err => {
       console.warn('[Firestore Init] Không thể ngắt kết nối mạng Firestore:', err);
     });
   }
 } catch (e) {
-  console.warn('[Firestore Init] Lỗi cấu hình offline-first cho Firestore:', e);
+  console.warn('[Firestore Init] Lỗi cấu hình cho Firestore:', e);
 }
 
 const googleProvider = new GoogleAuthProvider();
